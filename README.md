@@ -140,9 +140,7 @@ All the permuted grid level hypervectors are bound together to form the window's
 
 Written out as a formula, the window hypervector $w$ for a window of size $n$ is:
 
-$$
-w = \rho_1 (g_1) \circ \rho_2 (g_2) \circ ... \circ \rho_n (g_n)
-$$
+$$w = \rho_1 (g_1) \circ \rho_2 (g_2) \circ ... \circ \rho_n (g_n)$$
 where $\circ$ represents binding following the notation used in [[1]](#resources), $\rho_i$ is the permutation used for instant $i$, and $g_i$ is the grid level hypervector for the coordinate at instant $i$.
 
 ## Encoding a Goal
@@ -151,9 +149,7 @@ Once we have all the window hypervectors for a goal, we create the final goal hy
 
 As a formula, the goal hypervector $\gamma$ for a goal with $m$ windows is:
 
-$$
-\gamma = w_1 + w_2 + ... + w_m
-$$
+$$\gamma = w_1 + w_2 + ... + w_m$$
 where $+$ is the bundle operation following the notation used in [[1]](#resources).
 
 Once all the goal hypervectors have been created, to find the most similar goals given a specific goal, we calculate the distances from the given goal to all other goals and take the goals with the smallest distances.
