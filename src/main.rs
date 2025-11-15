@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::path::Path;
 
 
-use crate::preprocessing::{GameId, GoalId, PbpGoalLocData, preprocess_folder_data, read_folder};
+use crate::preprocessing::{GameId, GoalId, PbpGoalLocData, TrimmedPuckLocations, preprocess_folder_data, read_folder, take_last_n_instances};
 use crate::hdc_encoding::{_make_perm_arrays, create_grid_level_hypervecs, dist, encode_goal_seq_pos_scale};
 use polars::prelude::{Series, df, ParquetWriter, ParquetReader, SerReader, AnyValue};
 
@@ -63,7 +63,32 @@ fn main() -> Result<()> {
             },
             _ => ()
         };
-        let preprocessed_data = preprocess_folder_data(&loc_data);
+        let mut preprocessed_data = preprocess_folder_data(&loc_data);
+
+        // take the last n instances of each goal if specified
+        if args.last_n.is_some() {
+            let n = args.last_n.expect("No n set");
+            let mut shrunken_data = HashMap::with_capacity(preprocessed_data.len());
+            
+            for ((game_id, goal_id), trimmed_goal) in &preprocessed_data {
+                let last_n = take_last_n_instances(trimmed_goal.clone(), n);
+                shrunken_data.insert((game_id.clone(), goal_id.clone()), last_n);
+            }
+            preprocessed_data = shrunken_data;
+        }
+
+        // export preprocessed data if specified
+        if args.export_pp_loc_file.is_some() {
+            let export_pp_loc = args.export_pp_loc_file.expect("No file location given to export pre-processed goal data to");
+            match export_pp_loc_data(export_pp_loc, &preprocessed_data) {
+                Ok(_) => {
+                    println!("--- Finished exporting pre-processed goal location data");
+                },
+                Err(e) => {
+                    println!("Error when exporting pre-processed goal location data: {e}");
+                }
+            };
+        }
 
         // check that the specified goal is in the data read in before we spend
         // the time to create the hypervecs
@@ -194,6 +219,16 @@ struct Args {
     /// the import directory specified by the import-dir option
     #[arg(long, requires = "import_dir")]
     import_info: bool,
+
+    /// if true exports the pre-processed location data to the given file
+    /// won't export if you are importing goal hypervecs, grid level hypervecs,
+    /// and permutataion arrays
+    #[arg(long)]
+    export_pp_loc_file: Option<String>,
+
+    // if set, takes the last n instances of each goal
+    #[arg(long)]
+    last_n: Option<usize>
 }
 
 /// helper type for keeping track of goal distances
@@ -282,6 +317,48 @@ fn import_hv_info<P: AsRef<Path> + Display>(
     }
 
     Ok((grid_hvs, perm_arrays, goal_hvs_map))
+}
+
+/// Exports the pre-processed goal data to a parquet file
+/// The x and y coordinates have separate columns.
+fn export_pp_loc_data<P: AsRef<Path> + Display>(
+    output_file: P,
+    preprocessed_data: &HashMap<(GameId, GoalId), TrimmedPuckLocations>
+) -> Result<()> {
+    // set up columns that we'll use for exporting as one big dataframe
+    let mut game_ids_for_export = Vec::with_capacity(preprocessed_data.len());
+    let mut goal_ids_for_export = Vec::with_capacity(preprocessed_data.len());
+    let mut pp_goal_data_x_for_export = Vec::with_capacity(preprocessed_data.len()); // x coordinates
+    let mut pp_goal_data_y_for_export = Vec::with_capacity(preprocessed_data.len()); // y coordinates
+
+    for ((game_id, goal_id), trimmed_goal) in preprocessed_data {
+        game_ids_for_export.push(game_id.0);
+        goal_ids_for_export.push(goal_id.0);
+
+        // get the x and y coordinates
+        let mut x_coords_single_goal = Vec::with_capacity(trimmed_goal.coords.len());
+        let mut y_coords_single_goal = Vec::with_capacity(trimmed_goal.coords.len());
+
+        for coord in &trimmed_goal.coords {
+            x_coords_single_goal.push(coord.x);
+            y_coords_single_goal.push(coord.y);
+        }
+        pp_goal_data_x_for_export.push(x_coords_single_goal.iter().collect::<Series>());
+        pp_goal_data_y_for_export.push(y_coords_single_goal.iter().collect::<Series>());
+    }
+
+    // export pre-processed goal location data to a parquet file by building a dataframe of
+    // game id's, goal id's, x coordinates, and y coordinates
+    let mut export_df = df!(
+        "game_id" => game_ids_for_export,
+        "goal_id" => goal_ids_for_export,
+        "x_coordinates" => pp_goal_data_x_for_export,
+        "y_coordinates" => pp_goal_data_y_for_export
+    )?;
+    let mut file = std::fs::File::create(format!("{output_file}"))?;
+    ParquetWriter::new(&mut file).finish(&mut export_df)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

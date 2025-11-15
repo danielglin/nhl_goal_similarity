@@ -383,7 +383,7 @@ fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocati
 }
 
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct TrimmedPuckLocations {
     pub coords: Vec<Coord>
 }
@@ -720,6 +720,17 @@ pub fn preprocess_folder_data(folder_data: &PbpGoalLocData) -> HashMap<(GameId, 
         }
     }
     trimmed_info
+}
+
+/// Takes only the last n instances of a trimmed goal
+/// If the goal is less than n instances long, returns the trimmed goal as-is.
+pub fn take_last_n_instances(goal: TrimmedPuckLocations, n: usize) -> TrimmedPuckLocations {
+    if n > goal.coords.len() {
+        return goal
+    }
+
+    let coords = goal.coords[goal.coords.len()-n..].to_vec();
+    TrimmedPuckLocations { coords: coords }
 }
 
 #[cfg(test)]
@@ -2283,5 +2294,67 @@ mod tests {
             Coord { x: 202., y: 670. },
             Coord { x: 2301., y: 502. },
         ]});
+    }
+
+    // --------------------------------------------------
+    // take_last_n_instances() tests
+    // --------------------------------------------------
+
+    // goal with less than n should be returned as-is
+    #[test]
+    fn take_last_n_instances_lt_n() {
+        let trimmed_goal = TrimmedPuckLocations { coords: vec![
+            Coord { x: 1., y: 1. },
+            Coord { x: 2., y: 2. },
+            Coord { x: 3., y: 3. },
+        ] };
+        let n = 4;
+        let rslt = take_last_n_instances(trimmed_goal, n);
+        let expected_rslt = TrimmedPuckLocations { coords: vec![
+            Coord { x: 1., y: 1. },
+            Coord { x: 2., y: 2. },
+            Coord { x: 3., y: 3. },
+        ] };
+        assert_eq!(rslt, expected_rslt);
+    }
+
+    // goal with exactly n should be returned as-is
+    #[test]
+    fn take_last_n_instances_eq_n() {
+        let trimmed_goal = TrimmedPuckLocations { coords: vec![
+            Coord { x: 1., y: 1. },
+            Coord { x: 2., y: 2. },
+            Coord { x: 3., y: 3. },
+        ] };
+        let n = 3;
+        let rslt = take_last_n_instances(trimmed_goal, n);
+        let expected_rslt = TrimmedPuckLocations { coords: vec![
+            Coord { x: 1., y: 1. },
+            Coord { x: 2., y: 2. },
+            Coord { x: 3., y: 3. },
+        ] };
+        assert_eq!(rslt, expected_rslt);
+    }
+
+    // case where goal is longer than n
+    #[test]
+    fn take_last_n_instances_gt_n() {
+        let trimmed_goal = TrimmedPuckLocations { coords: vec![
+            Coord { x: 1., y: 1. },
+            Coord { x: 2., y: 2. },
+            Coord { x: 3., y: 3. },
+            Coord { x: 4., y: 4. },
+            Coord { x: 5., y: 5. },
+            Coord { x: 6., y: 6. },
+        ] };
+        let n = 4;
+        let rslt = take_last_n_instances(trimmed_goal, n);
+        let expected_rslt = TrimmedPuckLocations { coords: vec![
+            Coord { x: 3., y: 3. },
+            Coord { x: 4., y: 4. },
+            Coord { x: 5., y: 5. },
+            Coord { x: 6., y: 6. },
+        ] };
+        assert_eq!(rslt, expected_rslt);
     }
 }
