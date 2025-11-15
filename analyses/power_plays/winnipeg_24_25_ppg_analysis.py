@@ -1,4 +1,6 @@
-
+# winnipeg_24_25_ppg_analysis.py
+# Script for clustering 2024-2025 regular season regulation Winnipeg Jets 
+# power play goals
 
 import requests
 import json
@@ -14,11 +16,6 @@ from sklearn.metrics.pairwise import pairwise_distances
 
 import itertools
 from collections import deque
-# import sys
-# sys.path.append('../../../')
-# import goal_sim_hdc_helper_funcs as helpers
-# import os
-# import pathlib
 
 
 # convenience type for goals
