@@ -97,28 +97,12 @@ pub fn read_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<RawPuckLocatio
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
 
-    // println!("*** Reading goal data ***");
     let goal_loc_data: Vec<Instance> = serde_json::from_reader(reader)?;
-    // println!("goal loc data: {:?}", goal_loc_data);
 
     // go through each instance and pull out just the puck data
     let mut all_puck_info = vec![];
     for instance in &goal_loc_data {
-        // println!("********");
         let puck_data = instance.onIce.get(PUCK_ID);
-
-        // do an extra check of the id just to be safe
-        // let puck_data = match puck_data {
-        //     Some(p) => {
-        //         if p.id == 1 {
-        //             Some(Coord { x: p.x, y: p.y })
-        //         }
-        //         else {
-        //             None
-        //         }
-        //     },
-        //     None => None
-        // };
         let puck_coord = match puck_data {
             Some(o) => {
                 // sometimes the puck's hash map will be empty
@@ -214,11 +198,33 @@ pub struct GameId(pub u32);
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct GoalId(pub u32);
 
+#[derive(Debug)]
+pub enum TrackingType {
+    PuckOnly { goal_loc_data: HashMap<GameId, HashMap<GoalId, RawPuckLocationData>> },
+    PuckAndPlayer { goal_loc_data: HashMap<GameId, HashMap<GoalId, GoalRawPuckPlayerData>> },
+}
+
+#[derive(Debug)]
+struct PlayerId {
+    id: u32
+}
+
+/// Raw puck and player tracking data together
+/// puck_tracking: each element is a timestep's puck coordinates
+/// player_tracking: each element is all the player tracking data for a timestep
+/// Each element for both Option due to timesteps potentially missing coordinates
+#[derive(Debug)]
+struct GoalRawPuckPlayerData {
+    puck_tracking: RawPuckLocationData,
+    player_tracking: Vec<Option<HashMap<PlayerId, Coord>>>
+}
+
 /// Combines both goal location data and play-by-play data using two hash maps
 /// Both maps are keyed by the game id
 #[derive(Debug)]
 pub struct PbpGoalLocData {
-    pub goal_loc_data: HashMap<GameId, HashMap<GoalId, RawPuckLocationData>>,
+    // pub goal_loc_data: HashMap<GameId, HashMap<GoalId, RawPuckLocationData>>,
+    pub tracking_type: TrackingType,
     pub pbp_data: HashMap<GameId, PbpData>
 }
 
@@ -240,7 +246,7 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
 
             if path.is_dir() && (path_stem.len() == GAME_ID_LEN) {
                 // check if the directory is all digits so we know it's a 
-                // game director
+                // game directory
                 let game_id = match path_stem.to_string_lossy().parse::<u32>() {
                     Ok(id) => GameId(id),
                     Err(_) => {
@@ -281,26 +287,54 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
                                 continue
                             }
                         };
-                        let loc_data = match read_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
-                            Ok(ld) => ld,
-                            Err(e) => {
-                                println!("*** Error {e} when trying to parse goal data at {}", &game_path.to_string_lossy());
-                                continue
-                            }
-                        };
-                        // add goal location data
-                        // pbp_goal_data.goal_loc_data.insert(game_id, loc_data);
-                        match pbp_goal_data.goal_loc_data.get_mut(&game_id) {
-                            Some(map) => {
-                                map.insert(goal_id, loc_data);
+                        
+                        // getting just the puck data
+                        match &mut pbp_goal_data.tracking_type {
+                            TrackingType::PuckOnly { goal_loc_data } => {
+                                let loc_data = match read_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
+                                    Ok(ld) => ld,
+                                    Err(e) => {
+                                        println!("*** Error {e} when trying to parse goal data at {}", &game_path.to_string_lossy());
+                                        continue
+                                    }
+                                };
+
+                                // add goal location data
+                                match goal_loc_data.get_mut(&game_id) {
+                                    Some(map) => {
+                                        map.insert(goal_id, loc_data);
+                                    },
+                                    None => {
+                                        // need to create a new map if it doesn't exist
+                                        let mut goals_map = HashMap::new();
+                                        goals_map.insert(goal_id, loc_data);
+                                        goal_loc_data.insert(game_id, goals_map);
+                                    }
+                                };
                             },
-                            None => {
-                                // need to create a new map if it doesn't exist
-                                let mut goals_map = HashMap::new();
-                                goals_map.insert(goal_id, loc_data);
-                                pbp_goal_data.goal_loc_data.insert(game_id, goals_map);
+                            TrackingType::PuckAndPlayer {  } => {
+                                todo!()
                             }
                         };
+                        // let loc_data = match read_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
+                        //     Ok(ld) => ld,
+                        //     Err(e) => {
+                        //         println!("*** Error {e} when trying to parse goal data at {}", &game_path.to_string_lossy());
+                        //         continue
+                        //     }
+                        // };
+                        // // add goal location data
+                        // match pbp_goal_data.goal_loc_data.get_mut(&game_id) {
+                        //     Some(map) => {
+                        //         map.insert(goal_id, loc_data);
+                        //     },
+                        //     None => {
+                        //         // need to create a new map if it doesn't exist
+                        //         let mut goals_map = HashMap::new();
+                        //         goals_map.insert(goal_id, loc_data);
+                        //         pbp_goal_data.goal_loc_data.insert(game_id, goals_map);
+                        //     }
+                        // };
                     }
                     // read in the play-by-play files
                     else {
@@ -638,47 +672,112 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> TrimmedPuckLocations {
     TrimmedPuckLocations { coords: trimmed_coords }
 }
 
+/// Pre-processes a single goal's puck data
+fn preprocess_goal(coords: &Vec<Option<Coord>>, goal_details: &GoalDetails, home_team_id: &u16) {
+    let scoring_team_id = goal_details.scoring_team_id;
+    let home_team_defending_side = &goal_details.home_team_defending_side;
+    let away_team_defending_side;
+    let scoring_side;
+    let rotated_goal;
+    // let raw_puck_loc = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
+    //     Some(r) => r,
+    //     None => {
+    //         // println!("No goal location data for game {}, goal {}", game_id.0, goal_details.event_id);
+    //         continue;
+    //     }
+    // };
+
+    // clamp to valid min and max values
+    let mut clamped_coords = Vec::with_capacity(coords.len());
+    for coord in coords {
+        let clamped = match coord {
+            Some(c) => Some(clamp_coord(c)),
+            None => None
+        };
+        clamped_coords.push(clamped);
+    }
+
+    // determine if we need to rotate this goal
+    if home_team_defending_side == "Left" {
+        away_team_defending_side = String::from("Right");
+    } else {
+        away_team_defending_side = String::from("Left");
+    }
+
+    // home team scores
+    if scoring_team_id == *home_team_id {
+        scoring_side = away_team_defending_side;
+    // away team scores
+    } else {
+        scoring_side = home_team_defending_side.to_owned();
+    }
+
+    // need to rotate if the goal was scored on the left side of the ice
+    if scoring_side == "Left" {
+        rotated_goal = rotate_goal_coords(clamped_coords);
+    } else {
+        // rotated_goal = RotatedPuckLocations { coords: raw_puck_loc.coords.clone() };
+        let mut coords = Vec::with_capacity(clamped_coords.len());
+        for coord in clamped_coords {
+            match coord {
+                Some(c) => {
+                    coords.push(Some(Coord { x: c.get_x(), y: c.get_y() }));
+                }
+                None => {
+                    coords.push(None);
+                }
+            };
+        }
+        rotated_goal = RotatedPuckLocations { coords: coords };
+    }
+
+    // now trim the goal
+    let trimmed_goal = trim_goal_coords(&rotated_goal);
+    trimmed_info.insert((game_id.clone(), GoalId(goal_details.event_id)), trimmed_goal);
+}
+
 /// Rotates and trims all the goals in a folder
 pub fn preprocess_folder_data(folder_data: &PbpGoalLocData) -> HashMap<(GameId, GoalId), TrimmedPuckLocations> {
     let mut trimmed_info = HashMap::new();
-
+    
     for (game_id, pbp_data) in &folder_data.pbp_data {
 
         // use the game id to get all goal data for that game
         // and iterate through all those goals
-        let goal_loc_data_map = match folder_data.goal_loc_data.get(game_id) {
-            Some(map) => map,
-            None => {
-                println!("No goal files found for game {}", game_id.0);
-                continue;
-            }
-        };
+        // let goal_loc_data_map = match folder_data.goal_loc_data.get(game_id) {
+        //     Some(map) => map,
+        //     None => {
+        //         println!("No goal files found for game {}", game_id.0);
+        //         continue;
+        //     }
+        // };
         let home_team_id = pbp_data.home_team_id;
 
         // have to first clamp, rotate, and then trim each goal's tracking data
         for goal_details in &pbp_data.goals {
+            match folder_data.tracking_type {
+                TrackingType::PuckOnly { goal_loc_data } => {
+                    // grab raw puck tracking data
+                    let goal_loc_data_map = match goal_loc_data.get(game_id) {
+                        Some(map) => map,
+                        None => {
+                            println!("No goal files found for game {}", game_id.0);
+                            continue;
+                        }
+                    };
+
+                    // TODO: pre-process the raw puck tracking data
+                },
+                TrackingType::PuckAndPlayer { goal_loc_data } => {
+                    todo!()
+                }
+            };
             let scoring_team_id = goal_details.scoring_team_id;
             let home_team_defending_side = &goal_details.home_team_defending_side;
             let away_team_defending_side;
             let scoring_side;
             let rotated_goal;
-            let raw_puck_loc = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
-                Some(r) => r,
-                None => {
-                    // println!("No goal location data for game {}, goal {}", game_id.0, goal_details.event_id);
-                    continue;
-                }
-            };
-        
-            // clamp to valid min and max values
-            let mut clamped_coords = Vec::with_capacity(raw_puck_loc.coords.len());
-            for coord in &raw_puck_loc.coords {
-                let clamped = match coord {
-                    Some(c) => Some(clamp_coord(c)),
-                    None => None
-                };
-                clamped_coords.push(clamped);
-            }
+            let need_to_rotate; 
 
             // determine if we need to rotate this goal
             if home_team_defending_side == "Left" {
@@ -697,22 +796,54 @@ pub fn preprocess_folder_data(folder_data: &PbpGoalLocData) -> HashMap<(GameId, 
 
             // need to rotate if the goal was scored on the left side of the ice
             if scoring_side == "Left" {
-                rotated_goal = rotate_goal_coords(clamped_coords);
+                need_to_rotate = true;
             } else {
-                // rotated_goal = RotatedPuckLocations { coords: raw_puck_loc.coords.clone() };
-                let mut coords = Vec::with_capacity(clamped_coords.len());
-                for coord in clamped_coords {
-                    match coord {
-                        Some(c) => {
-                            coords.push(Some(Coord { x: c.get_x(), y: c.get_y() }));
-                        }
-                        None => {
-                            coords.push(None);
-                        }
-                    };
-                }
-                rotated_goal = RotatedPuckLocations { coords: coords };
+                need_to_rotate = false;
             }
+        
+            // clamp to valid min and max values
+            let mut clamped_coords = Vec::with_capacity(raw_puck_loc.coords.len());
+            for coord in &raw_puck_loc.coords {
+                let clamped = match coord {
+                    Some(c) => Some(clamp_coord(c)),
+                    None => None
+                };
+                clamped_coords.push(clamped);
+            }
+
+            // // determine if we need to rotate this goal
+            // if home_team_defending_side == "Left" {
+            //     away_team_defending_side = String::from("Right");
+            // } else {
+            //     away_team_defending_side = String::from("Left");
+            // }
+
+            // // home team scores
+            // if scoring_team_id == home_team_id {
+            //     scoring_side = away_team_defending_side;
+            // // away team scores
+            // } else {
+            //     scoring_side = home_team_defending_side.to_owned();
+            // }
+
+            // // need to rotate if the goal was scored on the left side of the ice
+            // if scoring_side == "Left" {
+            //     rotated_goal = rotate_goal_coords(clamped_coords);
+            // } else {
+            //     // rotated_goal = RotatedPuckLocations { coords: raw_puck_loc.coords.clone() };
+            //     let mut coords = Vec::with_capacity(clamped_coords.len());
+            //     for coord in clamped_coords {
+            //         match coord {
+            //             Some(c) => {
+            //                 coords.push(Some(Coord { x: c.get_x(), y: c.get_y() }));
+            //             }
+            //             None => {
+            //                 coords.push(None);
+            //             }
+            //         };
+            //     }
+            //     rotated_goal = RotatedPuckLocations { coords: coords };
+            // }
 
             // now trim the goal
             let trimmed_goal = trim_goal_coords(&rotated_goal);
