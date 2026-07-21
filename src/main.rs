@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::path::Path;
 
 
-use crate::preprocessing::{GameId, GoalId, PbpGoalLocData, TrimmedPuckLocations, preprocess_folder_data, read_folder, take_last_n_instances};
+use crate::preprocessing::{GameId, GoalId, PbpGoalLocData, TrackingType, TrimmedPuckLocations, preprocess_puck ,read_folder, take_last_n_instances};
 use crate::hdc_encoding::{_make_perm_arrays, create_grid_level_hypervecs, dist, encode_goal_seq_pos_scale};
 use polars::prelude::{Series, df, ParquetWriter, ParquetReader, SerReader, AnyValue};
 
@@ -53,7 +53,8 @@ fn main() -> Result<()> {
         // read in location JSON's, rotate, and trim them
         let input_dir = args.input_dir.expect("!!! If not importing goal hypervectors, need to provide an input directory of goal location JSON files");
         let mut loc_data = PbpGoalLocData {
-            goal_loc_data: HashMap::new(),
+            tracking_type: TrackingType::PuckOnly { goal_loc_data: HashMap::new() },
+            // goal_loc_data: HashMap::new(),
             pbp_data: HashMap::new()
         };
         
@@ -63,7 +64,44 @@ fn main() -> Result<()> {
             },
             _ => ()
         };
-        let mut preprocessed_data = preprocess_folder_data(&loc_data);
+
+        // TODO: check the logic that uses the new puck pre-processing func in a loop over all games and all goals
+        let mut preprocessed_data = HashMap::new();
+
+        match &mut loc_data.tracking_type {
+            TrackingType::PuckOnly { goal_loc_data } => {
+                for (game_id, pbp_data) in &loc_data.pbp_data {
+                    // use the game id to get all goal data for that game
+                    // and iterate through all those goals
+                    let goal_loc_data_map = match goal_loc_data.get(game_id) {
+                        Some(map) => map,
+                        None => {
+                            println!("No goal files found for game {}", game_id.0);
+                            continue;
+                        }
+                    };
+                    let home_team_id = pbp_data.home_team_id;
+
+                    // now go through all goals
+                    for goal_details in &pbp_data.goals {
+                        let raw_puck_locs = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
+                            Some(rpl) => rpl,
+                            None => continue
+                        };
+                        let (trimmed_goal_locs, _, _) = preprocess_puck(raw_puck_locs, goal_details, home_team_id);
+                        preprocessed_data.insert((game_id.clone(), GoalId(goal_details.event_id)), trimmed_goal_locs);
+                    }
+                }
+            },
+            _ => {
+                println!("Warning: failed to pre-process data in puck-only mode.");
+            }
+        };
+
+
+        // // OLD
+        // let mut preprocessed_data = preprocess_folder_data(&loc_data);
+        // // END OLD
 
         // take the last n instances of each goal if specified
         if args.last_n.is_some() {
