@@ -65,7 +65,6 @@ fn main() -> Result<()> {
             _ => ()
         };
 
-        // TODO: check the logic that uses the new puck pre-processing func in a loop over all games and all goals
         let mut preprocessed_data = HashMap::new();
 
         match &mut loc_data.tracking_type {
@@ -88,7 +87,7 @@ fn main() -> Result<()> {
                             Some(rpl) => rpl,
                             None => continue
                         };
-                        let (trimmed_goal_locs, _, _) = preprocess_puck(raw_puck_locs, goal_details, home_team_id);
+                        let (trimmed_goal_locs, _, _, _) = preprocess_puck(raw_puck_locs, goal_details, home_team_id);
                         preprocessed_data.insert((game_id.clone(), GoalId(goal_details.event_id)), trimmed_goal_locs);
                     }
                 }
@@ -264,7 +263,7 @@ struct Args {
     #[arg(long)]
     export_pp_loc_file: Option<String>,
 
-    // if set, takes the last n instances of each goal
+    /// if set, takes the last n instances of each goal
     #[arg(long)]
     last_n: Option<usize>
 }

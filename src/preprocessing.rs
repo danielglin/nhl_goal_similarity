@@ -162,6 +162,9 @@ pub fn read_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<RawPuckLocatio
     }
 }
 
+// TODO: Figure out the return type and make a new struc if needed
+/// Reads in the goal location data and returns both puck and player location info
+pub fn read_puck_player_loc_data<P: AsRef<Path> + Display>(path: P) {}
 
 // --------------------------------------
 // Structs for deserializing play-by-play data
@@ -312,6 +315,7 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
                                     }
                                 };
                             },
+                            // TODO: call new read_puck_player_loc_data()
                             TrackingType::PuckAndPlayer { goal_loc_data } => {
                                 todo!()
                             }
@@ -370,34 +374,11 @@ struct RotatedPuckLocations {
 }
 
 /// Rotates a goal's coordinates by 180 degrees
-// pub fn rotate_goal_coords(puck_locs: &RawPuckLocationData) -> RotatedPuckLocations {
 fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocations {
     const MAX_X: f64 = 2400.;
     const MAX_Y: f64 = 1015.;
     
     let mut rotated_coords = Vec::with_capacity(puck_locs.len());
-
-    // for coord in &puck_locs.coords {
-    //     match coord {
-    //         Some(c) => {
-    //             // let x_pos = c.x.min(MAX_X);
-    //             // let x_pos = x_pos.max(0.);
-
-    //             // let y_pos = c.y.min(MAX_Y);
-    //             // let y_pos = y_pos.max(0.);
-    //             let clamped_coord = clamp_coord(c);
-    //             let rot_x_pos = MAX_X - clamped_coord.get_x();
-    //             let rot_y_pos = MAX_Y - clamped_coord.get_y();
-    //             let coord = Coord{ x: rot_x_pos, y: rot_y_pos };
-                
-    //             rotated_coords.push(Some(coord));
-    //         },
-    //         None => {
-    //             rotated_coords.push(None)
-    //         }
-    //     };
-        
-    // }
 
     for coord in puck_locs {
         match coord {
@@ -465,9 +446,15 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
     // vars for trimming start
     let mut first_instance: &Option<Coord> = &None;
     let mut puck_stationary = true;
-    let mut in_faceoff = false;
+    let mut in_faceoff = false;  // ever in faceoff
     let mut starting_offset = 0;
     let mut starting_pt = 0;
+    let mut none_start_incremented_starting_pt = false; // flag for if moved the starting 
+                                                              // pt due to None's at the start
+                                                              // used to address issues w/ faceoff goals
+                                                              // w/ None's at the start 
+                                                              // (like 2025020182/160)
+    // let mut ever_in_faceoff = false; // flag for same 2025020182/160 issue
     
     // vars for trimming end
     let num_instances = goal.coords.len(); 
@@ -488,9 +475,23 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             // in the middle
             // also need to handle the case where first instance isn't None, but
             // the second instance is by using the starting offset
-            if (instant_num == (starting_pt + 1)) && (starting_offset > 1) {
+            
+            // also need to handle if the very first instant is None
+            // if ((instant_num == (starting_pt + 1)) && (starting_offset > 1)) || (instant_num == 0) { // old version
+            if (((instant_num == (starting_pt)) || (instant_num == (starting_pt+1) && in_faceoff))&& (starting_offset > 1)) || (instant_num == 0) { // new version
+                // println!("instant_num: {instant_num}, starting_pt: {starting_pt}");
                 starting_pt += 1;
+                // none_start_incremented_starting_pt = true;
+                // println!("in modified if: instant_num: {instant_num}, starting_pt: {starting_pt}");
             }
+
+            // handle cases where if have None's at the start and then puck's
+            // in a faceoff dot, starting_pt will be 1 too high
+            // happens in 2025020182/160
+            if instant_num == 0 {
+                none_start_incremented_starting_pt = true;
+            }
+            // println!("at end of instance loop for None's; instance: instant_num: {instant_num}, instance: {instance:?}, starting_pt: {starting_pt}, starting OFFSET: {starting_offset}");
             continue;
         }
         let instance_bare = instance.as_ref().unwrap(); // instance is guaranteed to be Some here due to None check above
@@ -550,6 +551,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             {
                 // println!("instance_bare: {:?} in faceoff dot", instance_bare);
                 in_faceoff = true;
+                // ever_in_faceoff = true;
             }
             
         }
@@ -566,6 +568,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             // need to be trimmed
             starting_pt += 1;
             // println!("instance_bare: {:?} to be trimmed", instance_bare);
+            // println!("stationary, not none first instance, in faceoff; instant_num: {instant_num}, starting_pt: {starting_pt}");
         }
         
         // trim the end
@@ -626,6 +629,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
         } else {
             curr_interval_first_instant = None;
         }
+        // println!("at end of instance loop; instance: instant_num: {instant_num}, instance: {instance:?}, starting_pt: {starting_pt}, starting OFFSET: {starting_offset}");
     }
     
     // cutoff_pt is None if puck never enters the net
@@ -633,28 +637,27 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
     // but not trim anything from the end
 
 
-    // let goal_iter;
-    // if cutoff_pt.is_none() {
-    //     goal_iter = goal.coords[starting_pt..].iter();
-    // } else {
-    //     goal_iter = goal.coords[starting_pt..=cutoff_pt.unwrap()].iter();
+    // adjust starting pt if there were None's at the start and was in faceoff
+    // to address the 2025020182/160 issue, which is where the starting pt
+    // is over by 1 when there are None's at the start and also in a faceoff
+    if none_start_incremented_starting_pt && in_faceoff {
+        starting_pt -= 1;
+    }
+    // println!("final starting_pt: {starting_pt}");
+    // println!("rotated puck locs: {goal:?}");
+    // println!("rotated puck locs:");
+    // debug: print goal
+    // let mut i = 0;
+    // for p_coord in &goal.coords {
+    //     println!("{i}: {p_coord:?}");
+    //     i += 1;
     // }
-    // // println!("Starting point: {starting_pt}, cutoff pt: {:?}", cutoff_pt);
-    // for coords in goal_iter {
-    //     match coords {
-    //         Some(c) => {
-    //             trimmed_coords.push(c.clone());
-    //         },
-    //         None => ()
-    //     }
-    // }
-    // TrimmedPuckLocations { coords: trimmed_coords }
     (starting_pt, cutoff_pt)
 }
 
 /// Pre-processes a single goal's puck data
 // fn preprocess_goal(raw_puck_tracking: &RawPuckLocationData, need_to_rotate: bool) -> (TrimmedPuckLocations, usize, Option<usize>) {
-pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &GoalDetails, home_team_id: u16) -> (TrimmedPuckLocations, usize, Option<usize>) {
+pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &GoalDetails, home_team_id: u16) -> (TrimmedPuckLocations, usize, Option<usize>, Vec<usize>) {
     // clamp to valid min and max values
     let mut clamped_coords = Vec::with_capacity(raw_puck_tracking.coords.len());
     for coord in &raw_puck_tracking.coords {
@@ -726,195 +729,44 @@ pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &G
 
     // now trim the goal
     let (starting_pt, cutoff_pt) = trim_goal_coords(&rotated_goal);
-    // let goal_iter;
-    // let mut trimmed_coords = vec![];
-
-    // if cutoff_pt.is_none() {
-    //     goal_iter = rotated_goal.coords[starting_pt..].iter();
-    // } else {
-    //     goal_iter = rotated_goal.coords[starting_pt..=cutoff_pt.unwrap()].iter();
-    // }
-    // for coords in goal_iter {
-    //     match coords {
-    //         Some(c) => {
-    //             trimmed_coords.push(c.clone());
-    //         },
-    //         None => ()
-    //     }
-    // }
-    // (TrimmedPuckLocations { coords: trimmed_coords }, starting_pt, cutoff_pt)
-    let trimmed_coords = subset_coords(&rotated_goal, starting_pt, cutoff_pt);
-    (trimmed_coords, starting_pt, cutoff_pt)
-    // trimmed_info.insert((game_id.clone(), GoalId(goal_details.event_id)), trimmed_goal);
+    let (trimmed_coords, timesteps) = subset_coords(&rotated_goal, starting_pt, cutoff_pt);
+    (trimmed_coords, starting_pt, cutoff_pt, timesteps)
 }
 
 /// Uses indices to cut off starting and ending portions of coordinates
-fn subset_coords(rotated_goal: &RotatedPuckLocations, starting_pt: usize, cutoff_pt: Option<usize>) -> TrimmedPuckLocations {
+/// The returned vec has the timesteps where the puck's coordinates aren't missing.
+/// That vec is used to keep the puck and player data aligned.
+/// When `starting_pt` is greater than 0, the vec still starts at 0.
+fn subset_coords(rotated_goal: &RotatedPuckLocations, starting_pt: usize, cutoff_pt: Option<usize>) -> (TrimmedPuckLocations, Vec<usize>) {
     let mut trimmed_coords = vec![];
+    let mut timesteps = vec![];
     let goal_iter;
 
-    if cutoff_pt.is_none() {
-        goal_iter = rotated_goal.coords[starting_pt..].iter();
-    } else {
-        goal_iter = rotated_goal.coords[starting_pt..=cutoff_pt.unwrap()].iter();
+    // if the starting point is greater than the cutoff, return an empty
+    // TrimmedPuckLocations and vec
+    if cutoff_pt.is_some() && starting_pt > cutoff_pt.unwrap() {
+        return (
+            TrimmedPuckLocations { coords: vec![] },
+            vec![]
+        )
     }
-    for coords in goal_iter {
+
+    if cutoff_pt.is_none() {
+        goal_iter = rotated_goal.coords[starting_pt..].iter().enumerate();
+    } else {
+        goal_iter = rotated_goal.coords[starting_pt..=cutoff_pt.unwrap()].iter().enumerate();
+    }
+    for (i, coords) in goal_iter {
         match coords {
             Some(c) => {
                 trimmed_coords.push(c.clone());
+                timesteps.push(i);
             },
             None => ()
         }
     }
-    TrimmedPuckLocations { coords: trimmed_coords }
+    (TrimmedPuckLocations { coords: trimmed_coords }, timesteps)
 }
-
-
-// /// Rotates and trims all the goals in a folder
-// pub fn preprocess_folder_data(folder_data: &PbpGoalLocData) -> HashMap<(GameId, GoalId), TrimmedPuckLocations> {
-//     let mut trimmed_info = HashMap::new();
-    
-//     for (game_id, pbp_data) in &folder_data.pbp_data {
-
-//         // use the game id to get all goal data for that game
-//         // and iterate through all those goals
-//         // let goal_loc_data_map = match folder_data.goal_loc_data.get(game_id) {
-//         //     Some(map) => map,
-//         //     None => {
-//         //         println!("No goal files found for game {}", game_id.0);
-//         //         continue;
-//         //     }
-//         // };
-//         let home_team_id = pbp_data.home_team_id;
-
-//         // have to first clamp, rotate, and then trim each goal's tracking data
-//         for goal_details in &pbp_data.goals {
-
-//             // first determine if we need to rotate this goal
-//             let scoring_team_id = goal_details.scoring_team_id;
-//             let home_team_defending_side = &goal_details.home_team_defending_side;
-//             let away_team_defending_side;
-//             let scoring_side;
-//             let rotated_goal;
-//             let need_to_rotate; 
-
-//             if home_team_defending_side == "Left" {
-//                 away_team_defending_side = String::from("Right");
-//             } else {
-//                 away_team_defending_side = String::from("Left");
-//             }
-
-//             // home team scores
-//             if scoring_team_id == home_team_id {
-//                 scoring_side = away_team_defending_side;
-//             // away team scores
-//             } else {
-//                 scoring_side = home_team_defending_side.to_owned();
-//             }
-
-//             // need to rotate if the goal was scored on the left side of the ice
-//             if scoring_side == "Left" {
-//                 need_to_rotate = true;
-//             } else {
-//                 need_to_rotate = false;
-//             }
-
-//             // pre-process puck tracking data, no matter if the mode is puck-only 
-//             // or both puck and player tracking data
-//             match folder_data.tracking_type {
-//                 TrackingType::PuckOnly { goal_loc_data } => {
-//                     // grab raw puck tracking data
-//                     let goal_loc_data_map = match goal_loc_data.get(game_id) {
-//                         Some(map) => map,
-//                         None => {
-//                             println!("No goal files found for game {}", game_id.0);
-//                             continue;
-//                         }
-//                     };
-//                     let raw_puck_loc = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
-//                         Some(r) => r,
-//                         None => {
-//                             // println!("No goal location data for game {}, goal {}", game_id.0, goal_details.event_id);
-//                             continue;
-//                         }
-//                     };
-//                     // TODO: pre-process the raw puck tracking data
-                    
-//                 },
-//                 TrackingType::PuckAndPlayer { goal_loc_data } => {
-//                     // get the goal's tracking data
-//                     let goal_loc_data_map = match goal_loc_data.get(game_id) {
-//                         Some(map) => map,
-//                         None => {
-//                             println!("No goal files found for game {}", game_id.0);
-//                             continue;
-//                         }
-//                     };
-//                     let raw_puck_player_data = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
-//                         Some(r) => r,
-//                         None => {
-//                             continue;
-//                         }
-//                     };
-
-//                     // first do puck pre-processing
-
-
-//                     // next do player pre-processing
-//                 }
-//             };
-        
-//             // clamp to valid min and max values
-//             let mut clamped_coords = Vec::with_capacity(raw_puck_loc.coords.len());
-//             for coord in &raw_puck_loc.coords {
-//                 let clamped = match coord {
-//                     Some(c) => Some(clamp_coord(c)),
-//                     None => None
-//                 };
-//                 clamped_coords.push(clamped);
-//             }
-
-//             // // determine if we need to rotate this goal
-//             // if home_team_defending_side == "Left" {
-//             //     away_team_defending_side = String::from("Right");
-//             // } else {
-//             //     away_team_defending_side = String::from("Left");
-//             // }
-
-//             // // home team scores
-//             // if scoring_team_id == home_team_id {
-//             //     scoring_side = away_team_defending_side;
-//             // // away team scores
-//             // } else {
-//             //     scoring_side = home_team_defending_side.to_owned();
-//             // }
-
-//             // // need to rotate if the goal was scored on the left side of the ice
-//             // if scoring_side == "Left" {
-//             //     rotated_goal = rotate_goal_coords(clamped_coords);
-//             // } else {
-//             //     // rotated_goal = RotatedPuckLocations { coords: raw_puck_loc.coords.clone() };
-//             //     let mut coords = Vec::with_capacity(clamped_coords.len());
-//             //     for coord in clamped_coords {
-//             //         match coord {
-//             //             Some(c) => {
-//             //                 coords.push(Some(Coord { x: c.get_x(), y: c.get_y() }));
-//             //             }
-//             //             None => {
-//             //                 coords.push(None);
-//             //             }
-//             //         };
-//             //     }
-//             //     rotated_goal = RotatedPuckLocations { coords: coords };
-//             // }
-
-//             // now trim the goal
-//             let trimmed_goal = trim_goal_coords(&rotated_goal);
-//             trimmed_info.insert((game_id.clone(), GoalId(goal_details.event_id)), trimmed_goal);
-//         }
-//     }
-//     trimmed_info
-// }
 
 /// Takes only the last n instances of a trimmed goal
 /// If the goal is less than n instances long, returns the trimmed goal as-is.
@@ -1576,7 +1428,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), rot_goal.coords.len());
         assert_eq!(trimmed.coords[0].x, 10.);
@@ -1587,6 +1439,10 @@ mod tests {
         
         assert_eq!(trimmed.coords[2].x, 12.);
         assert_eq!(trimmed.coords[2].y, 11.);
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal that has None's at the start and doesn't enter the goal area
@@ -1603,7 +1459,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0].x, 10.);
@@ -1614,6 +1470,11 @@ mod tests {
         
         assert_eq!(trimmed.coords[2].x, 12.);
         assert_eq!(trimmed.coords[2].y, 11.);
+
+        assert_eq!(starting_pt, 3);
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal that has exactly one None at the start should have that None
@@ -1628,7 +1489,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0].x, 10.);
@@ -1639,6 +1500,10 @@ mod tests {
         
         assert_eq!(trimmed.coords[2].x, 12.);
         assert_eq!(trimmed.coords[2].y, 11.);
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal that has None's at the end and doesn't enter the goal area
@@ -1655,7 +1520,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0].x, 10.);
@@ -1666,6 +1531,10 @@ mod tests {
         
         assert_eq!(trimmed.coords[2].x, 12.);
         assert_eq!(trimmed.coords[2].y, 11.);
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal that has None's in the middle and doesn't enter the goal area
@@ -1683,7 +1552,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 4);
         assert_eq!(trimmed.coords[0].x, 10.);
@@ -1697,6 +1566,10 @@ mod tests {
 
         assert_eq!(trimmed.coords[3].x, 13.);
         assert_eq!(trimmed.coords[3].y, 11.);
+
+        assert_eq!(timesteps, vec![
+            0, 3, 5, 6
+        ]);
     }
 
     // goal that has None's in the beginning, middle, and end and doesn't
@@ -1718,13 +1591,18 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 4);
         assert_eq!(trimmed.coords[0], Coord { x: 10., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[3], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 3, 5, 6
+        ]);
+        assert_eq!(starting_pt, 1);
     }
 
     // goal where the puck starts off in the top defensive faceoff dot should
@@ -1736,18 +1614,22 @@ mod tests {
             Some(Coord { x: 371.1, y: 201.2 }),
             Some(Coord { x: 371.2, y: 201.1 }),
             Some(Coord { x: 371.3, y: 200.9 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);        
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0 , 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the bottom defensive faceoff dot should
@@ -1759,19 +1641,22 @@ mod tests {
             Some(Coord { x: 371.1, y: 774.2 }),
             Some(Coord { x: 371.2, y: 774.2 }),
             Some(Coord { x: 371.3, y: 774.3 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }),  // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);        
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
 
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the top left neutral zone faceoff dot should
@@ -1783,19 +1668,23 @@ mod tests {
             Some(Coord { x: 955.4, y: 210.4 }),
             Some(Coord { x: 955.3, y: 210.3 }),
             Some(Coord { x: 955.2, y: 210.1 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
         // assert_eq!(trimmed.coords[0], Coord { x: 955.2, y: 210.1 });
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the bottom left neutral zone faceoff dot should
@@ -1807,19 +1696,22 @@ mod tests {
             Some(Coord { x: 955.4, y: 778.1 }),
             Some(Coord { x: 955.3, y: 778. }),
             Some(Coord { x: 955.2, y: 778.6 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
-        // assert_eq!(trimmed.coords[0], Coord { x: 955.2, y: 778.6 });
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the center ice faceoff dot should
@@ -1837,12 +1729,16 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);        
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the top right neutral zone faceoff dot should
@@ -1854,18 +1750,22 @@ mod tests {
             Some(Coord { x: 1410.6, y: 210.4 }),
             Some(Coord { x: 1410.7, y: 210.3 }),
             Some(Coord { x: 1410.8, y: 210.1 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);        
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the bottom right neutral zone faceoff dot should
@@ -1877,18 +1777,22 @@ mod tests {
             Some(Coord { x: 1410.6, y: 726.1 }),
             Some(Coord { x: 1410.7, y: 726.1 }),
             Some(Coord { x: 1410.8, y: 726.2 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the top offensive zone faceoff dot should
@@ -1900,18 +1804,22 @@ mod tests {
             Some(Coord { x: 2019.9, y: 210.4 }),
             Some(Coord { x: 2020.4, y: 210.3 }),
             Some(Coord { x: 2020.3, y: 210.1 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }),  // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where the puck starts off in the bottom offensive zone faceoff dot should
@@ -1923,18 +1831,60 @@ mod tests {
             Some(Coord { x: 2019.9, y: 776.4 }),
             Some(Coord { x: 2020.4, y: 775.8 }),
             Some(Coord { x: 2020.3, y: 775.6 }),
-            Some(Coord { x: 11., y: 11. }),
+            Some(Coord { x: 11., y: 11. }), // starts here
             Some(Coord { x: 12., y: 11. }),
             Some(Coord { x: 13., y: 11. }),
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0], Coord { x: 11., y: 11. });
         assert_eq!(trimmed.coords[1], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[2], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
+    }
+
+    // faceoff goal w/ None's in the middle of the faceoff data that should be
+    // trimmed
+    #[test]
+    fn trim_goal_faceoff_nones_middle() {
+        let coords = vec![
+            Some(Coord { x: 2035.4955, y: 216.197 }),
+            Some(Coord { x: 2035.8623, y: 218.18690000000004 }),
+            Some(Coord { x: 2035.8656, y: 219.24480000000005 }),
+            Some(Coord { x: 2035.8115, y: 219.71659999999997 }),
+            Some(Coord { x: 2035.7099, y: 219.83069999999998 }),
+
+            Some(Coord { x: 2035.2651, y: 219.85130000000004 }),
+            Some(Coord { x: 2035.2201, y: 219.3994 }),
+            None,
+            None,
+            None,
+
+            None,
+            None,
+            Some(Coord { x: 2021.6512, y: 236.29219999999998 }),
+            Some(Coord { x: 2020.2434, y: 239.3139 }),
+            Some(Coord { x: 2018.282, y: 242.452 }),
+
+            Some(Coord { x: 2019.4605999999999, y: 247.99440000000004 }), // starts here
+            Some(Coord { x: 2028.5012, y: 269.7925 }),
+            Some(Coord { x: 2021.4669, y: 270.52189999999996 }),
+            Some(Coord { x: 2173.5117, y: 418.5711 }),
+            Some(Coord { x: 2172.869, y: 423.44820000000004 }),
+            
+            Some(Coord { x: 2232.2745, y: 483.49969999999996 }),  // enters goal here
+        ];
+        let rot_goal = RotatedPuckLocations { coords };
+        let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
+
+        assert_eq!(starting_pt, 15);
+        assert!(cutoff_pt.is_none());
     }
 
     // goal where the puck is stationary at the start but isn't in a faceoff dot
@@ -1952,7 +1902,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 7);
         assert_eq!(trimmed.coords[0], Coord { x: 62.81, y: 522.26 });
@@ -1962,6 +1912,10 @@ mod tests {
         assert_eq!(trimmed.coords[4], Coord { x: 62.82, y: 522.24 });
         assert_eq!(trimmed.coords[5], Coord { x: 62.80, y: 522.26 });
         assert_eq!(trimmed.coords[6], Coord { x: 13., y: 11. });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6
+        ]);
     }
 
     // goal where puck enters goal before 35% at earliest should be trimmed there
@@ -1982,12 +1936,16 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
         
         assert_eq!(trimmed.coords.len(), 3);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
         assert_eq!(trimmed.coords[1], Coord { x: 2019.9, y: 776.4 });
         assert_eq!(trimmed.coords[2], Coord { x: 2250.4, y: 500.1444 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2
+        ]);
     }
 
     // goal where puck enters goal before 35% at earliest but again before 60%
@@ -2009,7 +1967,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 5);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
@@ -2017,6 +1975,10 @@ mod tests {
         assert_eq!(trimmed.coords[2], Coord { x: 2250.4, y: 500.1444 });
         assert_eq!(trimmed.coords[3], Coord { x: 2020.3, y: 775.6 });
         assert_eq!(trimmed.coords[4], Coord { x: 2246.1, y: 545.3 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4
+        ]);
     }
 
     // goal where puck enters goal before 35% at earliest but again at 60%
@@ -2038,7 +2000,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 6);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
@@ -2047,6 +2009,10 @@ mod tests {
         assert_eq!(trimmed.coords[3], Coord { x: 2020.3, y: 775.6 });
         assert_eq!(trimmed.coords[4], Coord { x: 2020.4, y: 776.6 });
         assert_eq!(trimmed.coords[5], Coord { x: 2246.1, y: 545.3 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5
+        ]);
     }
 
     // goal where puck enters goal before 35%, between 35-60%, and after 60%
@@ -2068,7 +2034,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 7);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
@@ -2078,6 +2044,10 @@ mod tests {
         assert_eq!(trimmed.coords[4], Coord { x: 2260.4, y: 559.2 });
         assert_eq!(trimmed.coords[5], Coord { x: 2000.1, y: 800.2 });
         assert_eq!(trimmed.coords[6], Coord { x: 2246.1, y: 545.3 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6
+        ]);
     }
 
     // goal where puck enters goal before 35%, and after 60% twice
@@ -2099,7 +2069,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 7);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
@@ -2109,6 +2079,10 @@ mod tests {
         assert_eq!(trimmed.coords[4], Coord { x: 2020.4, y: 775.6 });
         assert_eq!(trimmed.coords[5], Coord { x: 2000.1, y: 800.2 });
         assert_eq!(trimmed.coords[6], Coord { x: 2246.1, y: 545.3 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6
+        ]);
     }
 
     // goal where puck enters between 35-40% and is less than 200 long
@@ -2132,13 +2106,17 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 4);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
         assert_eq!(trimmed.coords[1], Coord { x: 2019.9, y: 776.4 });
         assert_eq!(trimmed.coords[2], Coord { x: 2020.3, y: 775.6 });
         assert_eq!(trimmed.coords[3], Coord { x: 2250.4, y: 500.1444 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3
+        ]);
     }
 
     // goal where puck enters between 35-40% and is less than 200 long
@@ -2162,7 +2140,7 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 10);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
@@ -2176,6 +2154,10 @@ mod tests {
         assert_eq!(trimmed.coords[7], Coord { x: 12., y: 11. });
         assert_eq!(trimmed.coords[8], Coord { x: 2000.1, y: 800.2 });
         assert_eq!(trimmed.coords[9], Coord { x: 2251.3, y: 501.1443 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+        ]);
     }
 
     // goal where puck enters between 35-40% and is over 200 in length
@@ -2197,10 +2179,12 @@ mod tests {
         coords[74] = Some(Coord { x: 2249., y: 541. });
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 73);
         assert_eq!(trimmed.coords[72], Coord { x: 2250., y: 541. });
+
+        assert_eq!(timesteps, (0..=72).collect::<Vec<usize>>());
     }
 
     // goal where puck enters between 40-60% and never again should be cut off when it enters
@@ -2221,13 +2205,17 @@ mod tests {
         ];
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 4);
         assert_eq!(trimmed.coords[0], Coord { x: 1010.5, y: 900.5 });
         assert_eq!(trimmed.coords[1], Coord { x: 2019.9, y: 776.4 });
         assert_eq!(trimmed.coords[2], Coord { x: 2020.3, y: 775.6 });
         assert_eq!(trimmed.coords[3], Coord { x: 2250.4, y: 500.1444 });
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3
+        ]);
     }
 
     // goal where puck enters between 40-60% and again before 60% should be cut off 
@@ -2253,10 +2241,12 @@ mod tests {
         coords[57] = Some(Coord { x: 2250., y: 542. });
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 56);
         assert_eq!(trimmed.coords[55], Coord { x: 2249., y: 540. });
+
+        assert_eq!(timesteps, (0..=55).collect::<Vec<usize>>());
     }
 
     // goal where puck enters between 40-60% and twice afer 60% should be cut off
@@ -2286,10 +2276,12 @@ mod tests {
         coords[77] = Some(Coord { x: 2289., y: 500. });
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 66);
         assert_eq!(trimmed.coords[65], Coord { x: 2249., y: 540.});
+
+        assert_eq!(timesteps, (0..=65).collect::<Vec<usize>>());
     }
 
     // goal where puck enters after 60% twice should be cutoff at the first time
@@ -2314,10 +2306,12 @@ mod tests {
         coords[77] = Some(Coord { x: 2289., y: 500. });
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 66);
         assert_eq!(trimmed.coords[65], Coord { x: 2249., y: 540.});
+
+        assert_eq!(timesteps, (0..=65).collect::<Vec<usize>>());
     }
 
     // goal with None's at the start shouldn't throw off percentages used
@@ -2352,10 +2346,36 @@ mod tests {
         coords[77] = Some(Coord { x: 2289., y: 500. });
         let rot_goal = RotatedPuckLocations { coords };
         let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
-        let trimmed = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
 
         assert_eq!(trimmed.coords.len(), 16);
         assert_eq!(trimmed.coords[15], Coord { x: 2249., y: 540.});
+
+        assert_eq!(timesteps, (0..=15).collect::<Vec<usize>>());
+    }
+
+    // start of goal 2025020182/160, where there is a discrepancy between
+    // the old code and new code results due to having None's at the start
+    // and being in faceoff at start as well
+    #[test]
+    fn trim_goal_none_start_faceoff() {
+        let coords = vec![
+            None,
+            None,
+            Some(Coord { x: 1211.9485, y: 498.5147 }),
+            Some(Coord { x: 1230.1508, y: 483.0261 }),
+            Some(Coord { x: 1248.6075, y: 467.4361 }),
+
+            Some(Coord { x: 1266.5463, y: 451.9476 }),
+            Some(Coord { x: 1283.9319, y: 436.5517 }),
+        ];
+        let rot_goal = RotatedPuckLocations { coords };
+        let (starting_pt, cutoff_pt) = trim_goal_coords(&rot_goal);
+        // let (starting_pt, cutoff_pt) = trim_goal_coords_draft(&rot_goal);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+        println!("starting_pt: {starting_pt}");
+        assert_eq!(trimmed.coords.len(), 4);
+        assert_eq!(timesteps.len(), 4);
     }
 
     // --------------------------------------------------
@@ -2489,7 +2509,7 @@ mod tests {
         ]};
         let home_team_id = 19;
 
-        let (trimmed_puck_locs, starting_pt, cutoff_pt) = preprocess_puck(&goal_10, &goal_details, home_team_id);
+        let (trimmed_puck_locs, starting_pt, cutoff_pt, timesteps) = preprocess_puck(&goal_10, &goal_details, home_team_id);
         assert_eq!(trimmed_puck_locs, TrimmedPuckLocations { coords: vec![
             Coord { x: 1010.5, y: 900.5 },
             Coord { x: 2019.9, y: 776.4 },
@@ -2498,6 +2518,479 @@ mod tests {
         ]});
         assert_eq!(starting_pt, 0);
         assert_eq!(cutoff_pt, Some(3));
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3
+        ])
+    }
+
+    #[test]
+    fn preprocess_puck_rotate_trim() {
+        let goal_details = GoalDetails { event_id: 10, scoring_team_id: 19, home_team_defending_side: String::from("Right"), ppt_replay_url: Some(String::from("")) };
+        let goal_10 = RawPuckLocationData { coords: vec![
+            Some(Coord { x: 1390., y: 114.5 }),
+            Some(Coord { x: 381., y: 239. }),
+            Some(Coord { x: 20., y: 1. }),
+            Some(Coord { x: 150., y: 515. }),
+            Some(Coord { x: 150., y: 515.1443 }),
+        ]};
+        let home_team_id = 19;
+
+        let (trimmed_puck_locs, starting_pt, cutoff_pt, timesteps) = preprocess_puck(&goal_10, &goal_details, home_team_id);
+        assert_eq!(trimmed_puck_locs, TrimmedPuckLocations { coords: vec![
+            Coord { x: 1010., y: 900.5 },
+            Coord { x: 2019., y: 776. },
+            Coord { x: 2380., y: 1014. },
+            Coord { x: 2250., y: 500. },
+        ]});
+        assert_eq!(starting_pt, 0);
+        assert_eq!(cutoff_pt, Some(3));
+
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3
+        ]);
+    }
+
+    // --------------------------------------------------
+    // subset_coords() test
+    // --------------------------------------------------
+
+    // no timestamps missing puck locations
+    #[test]
+    fn subset_coords_full() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = Some(9);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+        ]);
+    }
+
+    // one timestamp missing puck location
+    #[test]
+    fn subset_coords_one_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            None,
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2190., y: 143.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9
+        ]);
+    }
+
+        // multiple timestamps missing puck location
+    #[test]
+    fn subset_coords_many_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            None,
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            None,
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2191., y: 143.2 }),
+            Some(Coord { x: 2190., y: 144.2 }),
+            None
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2191., y: 143.2 },
+            Coord { x: 2190., y: 144.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            1, 2, 3, 4, 6, 7, 8
+        ]);
+    }
+
+    // test all timesteps are missing puck location
+    #[test]
+    fn subset_coords_all_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            None,
+            None,
+            None,
+            None
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![]});
+        let expected_timesteps: Vec<usize> = vec![];
+        assert_eq!(timesteps, expected_timesteps);
+    }
+
+    // test cutoff all but one timestep
+    #[test]
+    fn subset_coords_cutoff_all_but_one() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = Some(0);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2190., y: 143.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0
+        ]);
+    }
+
+    // test cutoff point being in middle
+    #[test]
+    fn subset_coords_cutoff_mid() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2190., y: 143.2 }),
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = Some(5);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5
+        ]);
+    }
+
+    // test missing locations with cutoff
+    #[test]
+    fn subset_coords_cutoff_some_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            None,
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            None,
+            Some(Coord { x: 2198., y: 150.2 }),
+            None,
+            Some(Coord { x: 2190., y: 143.2 }),
+        ]};
+        let starting_pt = 0;
+        let cutoff_pt = Some(7);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2198., y: 150.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 4, 5, 7
+        ]);
+    }
+
+    // test starting point is in the middle
+    #[test]
+    fn subset_coords_mid_starting_pt() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2193., y: 141.2 }),
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 1;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2200.2, y: 141.2 },
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2193., y: 141.2 },
+            Coord { x: 2194., y: 142.2 },
+            Coord { x: 2195., y: 145.2 },
+            Coord { x: 2196., y: 146.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8
+        ]);
+    }
+
+    // testing starting point at the very end
+    #[test]
+    fn subset_coords_end_starting_pt() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2193., y: 141.2 }),
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 9;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2196., y: 146.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0
+        ]);
+    }
+
+    // testing a starting point beyond the length of the rotated puck locations
+    #[test]
+    fn subset_coords_beyond_starting_pt() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2193., y: 141.2 }),
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 10;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![]});
+        let expected_timesteps: Vec<usize> = vec![];
+        assert_eq!(timesteps, expected_timesteps);
+    }
+
+    // testing a starting point that is greater than the cutoff point
+    #[test]
+    fn subset_coords_starting_pt_gt_cutoff() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2193., y: 141.2 }),
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 7;
+        let cutoff_pt = Some(2);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![]});
+        let expected_timesteps: Vec<usize> = vec![];
+        assert_eq!(timesteps, expected_timesteps);
+    }
+
+    // testing having a valid starting point with a cutoff point
+    #[test]
+    fn subset_coords_starting_pt_cutoff() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            Some(Coord { x: 1987.2, y: 132.7 }),
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2193., y: 141.2 }),
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 3;
+        let cutoff_pt = Some(8);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 1987.2, y: 132.7 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2193., y: 141.2 },
+            Coord { x: 2194., y: 142.2 },
+            Coord { x: 2195., y: 145.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 1, 2, 3, 4, 5
+        ]);
+    }
+
+    // testing having starting pt be at timestep with missing location
+    #[test]
+    fn subset_coords_starting_pt_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            None,
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            None,
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 3;
+        let cutoff_pt = None;
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2194., y: 142.2 },
+            Coord { x: 2195., y: 145.2 },
+            Coord { x: 2196., y: 146.2 }
+        ]});
+        assert_eq!(timesteps, vec![
+            1, 2, 4, 5, 6
+        ]);
+    }
+
+    // testing having starting pt, cutoff, and missing locations
+    #[test]
+    fn subset_coords_starting_pt_cutoff_missing() {
+        let rot_goal = RotatedPuckLocations { coords: vec![
+            Some(Coord { x: 2190., y: 143.2 }),
+            Some(Coord { x: 2200.2, y: 141.2 }),
+            Some(Coord { x: 2190.1, y: 138.6 }),
+            None,
+            Some(Coord { x: 1887.4, y: 120.2 }),
+
+            Some(Coord { x: 2190., y: 143.2 }),
+            None,
+            Some(Coord { x: 2194., y: 142.2 }),
+            Some(Coord { x: 2195., y: 145.2 }),
+            Some(Coord { x: 2196., y: 146.2 }),
+        ]};
+        let starting_pt = 2;
+        let cutoff_pt = Some(8);
+        let (trimmed, timesteps) = subset_coords(&rot_goal, starting_pt, cutoff_pt);
+
+        assert_eq!(trimmed, TrimmedPuckLocations { coords: vec![
+            Coord { x: 2190.1, y: 138.6 },
+            Coord { x: 1887.4, y: 120.2 },
+
+            Coord { x: 2190., y: 143.2 },
+            Coord { x: 2194., y: 142.2 },
+            Coord { x: 2195., y: 145.2 },
+        ]});
+        assert_eq!(timesteps, vec![
+            0, 2, 3, 5, 6
+        ]);
     }
 
     // // --------------------------------------------------
