@@ -54,7 +54,6 @@ fn main() -> Result<()> {
         let input_dir = args.input_dir.expect("!!! If not importing goal hypervectors, need to provide an input directory of goal location JSON files");
         let mut loc_data = PbpGoalLocData {
             tracking_type: TrackingType::PuckOnly { goal_loc_data: HashMap::new() },
-            // goal_loc_data: HashMap::new(),
             pbp_data: HashMap::new()
         };
         

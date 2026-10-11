@@ -164,7 +164,100 @@ pub fn read_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<RawPuckLocatio
 
 // TODO: Figure out the return type and make a new struc if needed
 /// Reads in the goal location data and returns both puck and player location info
-pub fn read_puck_player_loc_data<P: AsRef<Path> + Display>(path: P) {}
+pub fn read_puck_player_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<GoalRawPuckPlayerData> {
+    const PUCK_ID: &str = "1";
+
+    let file = File::open(&path)?;
+    let reader = BufReader::new(file);
+
+    let goal_loc_data: Vec<Instance> = serde_json::from_reader(reader)?;
+
+    // go through each instance 
+    let mut all_puck_info = vec![];
+    let mut all_players_info = vec![];
+    for instance in &goal_loc_data {
+        // go through each on-ice entity for a timestep
+        let mut instance_players_info = HashMap::new();
+
+        for (id, entity_map) in &instance.onIce {
+            let coord = if entity_map.get("x").is_some() && entity_map.get("y").is_some() {
+                // check that both x and y coordinates are floats just to
+                // be safe, and then extract then to create the puck's
+                // coordinate
+                if entity_map["x"].is_number() && entity_map["y"].is_number() {
+                    let x = match entity_map["x"].as_f64() {
+                        Some(x) => x,
+                        None => {
+                            continue
+                        }
+                    };
+                    let y = match entity_map["y"].as_f64() {
+                        Some(y) => y,
+                        None => {
+                            continue
+                        }
+                    };
+                    Some(Coord { x, y })
+                // set puck info as None if x and y aren't floats
+                } else {
+                    None
+                }
+            // set puck info as None if x and y aren't in the puck's 
+            // hash map (the hash map is probably empty in this case)
+            } else {
+                None
+            };
+
+            if id == PUCK_ID {
+                all_puck_info.push(coord);
+            } else {
+                let player_id;
+                let team_id;
+                // get the player id
+                if entity_map.get("playerId").is_some() {
+                    player_id = match entity_map["playerId"].as_u64() {
+                        Some(player_id) => player_id,
+                        None => {
+                            continue
+                        }
+                    };
+                } else {
+                    continue
+                };
+
+                // get the team id
+                if entity_map.get("teamId").is_some() {
+                    team_id = match entity_map["teamId"].as_u64() {
+                        Some(team_id) => team_id,
+                        None => {
+                            continue
+                        }
+                    };
+                } else {
+                    continue
+                };
+                // if the player's coordinate is None, don't bother adding it
+                // to the map
+                if coord.is_none() {
+                    continue
+                }
+                let player_info = PlayerInfo { id: player_id as u32, team_id: team_id as u32 };
+                instance_players_info.insert(player_info, coord.unwrap()); // coord is guaranteed to be Some
+            };
+        }
+    // if there is no player info (the map is empty), add a None to the player info vec
+    if instance_players_info.is_empty() {
+        all_players_info.push(None);
+    } else {
+        all_players_info.push(Some(instance_players_info));
+    };
+    
+    }
+    Ok(GoalRawPuckPlayerData{ 
+        puck_tracking: RawPuckLocationData { coords: all_puck_info },
+        player_tracking: all_players_info
+    })
+}
 
 // --------------------------------------
 // Structs for deserializing play-by-play data
@@ -207,19 +300,23 @@ pub enum TrackingType {
     PuckAndPlayer { goal_loc_data: HashMap<GameId, HashMap<GoalId, GoalRawPuckPlayerData>> },
 }
 
-#[derive(Debug)]
-struct PlayerId {
-    id: u32
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+struct PlayerInfo {
+    id: u32,
+    team_id: u32
 }
 
 /// Raw puck and player tracking data together
 /// puck_tracking: each element is a timestep's puck coordinates
 /// player_tracking: each element is all the player tracking data for a timestep
-/// Each element for both Option due to timesteps potentially missing coordinates
+/// Each element for both is an Option due to timesteps potentially missing coordinates
+/// An element in the player vector would be an option if there is no location
+/// data for any player for that timestep
+/// The two vectors line up
 #[derive(Debug)]
-struct GoalRawPuckPlayerData {
+pub struct GoalRawPuckPlayerData {
     puck_tracking: RawPuckLocationData,
-    player_tracking: Vec<Option<HashMap<PlayerId, Coord>>>
+    player_tracking: Vec<Option<HashMap<PlayerInfo, Coord>>>
 }
 
 /// Combines both goal location data and play-by-play data using two hash maps
@@ -317,7 +414,26 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
                             },
                             // TODO: call new read_puck_player_loc_data()
                             TrackingType::PuckAndPlayer { goal_loc_data } => {
-                                todo!()
+                                let loc_data = match read_puck_player_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
+                                    Ok(ld) => ld,
+                                    Err(e) => {
+                                        println!("*** Error {e} when trying to parse goal data at {}", &game_path.to_string_lossy());
+                                        continue
+                                    }
+                                };
+
+                                // add goal location data
+                                match goal_loc_data.get_mut(&game_id) {
+                                    Some(map) => {
+                                        map.insert(goal_id, loc_data);
+                                    },
+                                    None => {
+                                        // need to create a new map if it doesn't exist
+                                        let mut goals_map = HashMap::new();
+                                        goals_map.insert(goal_id, loc_data);
+                                        goal_loc_data.insert(game_id, goals_map);
+                                    }
+                                };
                             }
                         };
                         // let loc_data = match read_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
@@ -373,21 +489,31 @@ struct RotatedPuckLocations {
     pub coords: Vec<Option<Coord>>
 }
 
-/// Rotates a goal's coordinates by 180 degrees
-fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocations {
+/// Rotate a single coordinate
+fn _rotate_coord(coord: ClampedCoord) -> Coord {
     const MAX_X: f64 = 2400.;
     const MAX_Y: f64 = 1015.;
+
+    Coord{ x: MAX_X - coord.get_x(), y: MAX_Y - coord.get_y() }
+}
+
+/// Rotates a goal's coordinates by 180 degrees
+fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocations {
+    // const MAX_X: f64 = 2400.;
+    // const MAX_Y: f64 = 1015.;
     
     let mut rotated_coords = Vec::with_capacity(puck_locs.len());
 
     for coord in puck_locs {
         match coord {
             Some(c) => {
-                let rot_x_pos = MAX_X - c.get_x();
-                let rot_y_pos = MAX_Y - c.get_y();
-                let coord = Coord{ x: rot_x_pos, y: rot_y_pos };
+                // let rot_x_pos = MAX_X - c.get_x();
+                // let rot_y_pos = MAX_Y - c.get_y();
+                // let coord = Coord{ x: rot_x_pos, y: rot_y_pos };
+                // rotated_coords.push(Some(coord));
+                let rot_coord = _rotate_coord(c);
                 
-                rotated_coords.push(Some(coord));
+                rotated_coords.push(Some(rot_coord));
             },
             None => {
                 rotated_coords.push(None)
@@ -655,26 +781,12 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
     (starting_pt, cutoff_pt)
 }
 
-/// Pre-processes a single goal's puck data
-// fn preprocess_goal(raw_puck_tracking: &RawPuckLocationData, need_to_rotate: bool) -> (TrimmedPuckLocations, usize, Option<usize>) {
-pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &GoalDetails, home_team_id: u16) -> (TrimmedPuckLocations, usize, Option<usize>, Vec<usize>) {
-    // clamp to valid min and max values
-    let mut clamped_coords = Vec::with_capacity(raw_puck_tracking.coords.len());
-    for coord in &raw_puck_tracking.coords {
-        let clamped = match coord {
-            Some(c) => Some(clamp_coord(c)),
-            None => None
-        };
-        clamped_coords.push(clamped);
-    }
-
-    // determine if we need to rotate this goal
+/// Determines if a goal's coordinates need to be rotated
+fn need_to_rotate(goal_details: &GoalDetails, home_team_id: u16) -> bool {
     let scoring_team_id = goal_details.scoring_team_id;
     let home_team_defending_side = &goal_details.home_team_defending_side;
     let away_team_defending_side;
     let scoring_side;
-    let rotated_goal;
-    // let need_to_rotate; 
 
     if home_team_defending_side == "Left" {
         away_team_defending_side = String::from("Right");
@@ -690,8 +802,31 @@ pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &G
         scoring_side = home_team_defending_side.to_owned();
     }
 
-    // need to rotate if the goal was scored on the left side of the ice
     if scoring_side == "Left" {
+        true
+    } else {
+        false
+    }
+}
+
+/// Pre-processes a single goal's puck data
+// fn preprocess_goal(raw_puck_tracking: &RawPuckLocationData, need_to_rotate: bool) -> (TrimmedPuckLocations, usize, Option<usize>) {
+pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &GoalDetails, home_team_id: u16) -> (TrimmedPuckLocations, usize, Option<usize>, Vec<usize>) {
+    // clamp to valid min and max values
+    let mut clamped_coords = Vec::with_capacity(raw_puck_tracking.coords.len());
+    for coord in &raw_puck_tracking.coords {
+        let clamped = match coord {
+            Some(c) => Some(clamp_coord(c)),
+            None => None
+        };
+        clamped_coords.push(clamped);
+    }
+
+    let rotated_goal;
+    let do_rotate = need_to_rotate(&goal_details, home_team_id);
+
+    // need to rotate if the goal was scored on the left side of the ice
+    if do_rotate {
         rotated_goal = rotate_goal_coords(clamped_coords);
     } else {
         let mut coords = Vec::with_capacity(clamped_coords.len());
@@ -708,29 +843,96 @@ pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &G
         rotated_goal = RotatedPuckLocations { coords: coords };
     }
 
-    // // need to rotate if the goal was scored on the left side of the ice
-    // let rotated_goal;
-    // if need_to_rotate {
-    //     rotated_goal = rotate_goal_coords(clamped_coords);
-    // } else {
-    //     let mut coords = Vec::with_capacity(clamped_coords.len());
-    //     for coord in clamped_coords {
-    //         match coord {
-    //             Some(c) => {
-    //                 coords.push(Some(Coord { x: c.get_x(), y: c.get_y() }));
-    //             }
-    //             None => {
-    //                 coords.push(None);
-    //             }
-    //         };
-    //     }
-    //     rotated_goal = RotatedPuckLocations { coords: coords };
-    // }
-
     // now trim the goal
     let (starting_pt, cutoff_pt) = trim_goal_coords(&rotated_goal);
     let (trimmed_coords, timesteps) = subset_coords(&rotated_goal, starting_pt, cutoff_pt);
     (trimmed_coords, starting_pt, cutoff_pt, timesteps)
+}
+
+/// Pre-processed puck and player location data for a single goal
+struct PreprocessedPuckPlayerLocationGoalData {
+    puck_coords: TrimmedPuckLocations,
+    puck_timesteps: Vec<usize>,
+    goal_ids: Vec<u32>,
+    // player_timesteps: Vec<usize>,
+    player_timesteps: Vec<u32>,
+    player_ids: Vec<u32>,
+    team_ids: Vec<u32>,
+    xs: Vec<f64>,
+    ys: Vec<f64>
+}
+
+/// Pre-process the player and puck location data for a single goal
+pub fn preprocess_player_puck(raw_puck_player_tracking: &GoalRawPuckPlayerData, goal_details: &GoalDetails, home_team_id: u16) -> PreprocessedPuckPlayerLocationGoalData {
+    const NUM_PLAYERS_ON_ICE_5V5: usize = 12;
+
+    // need to first pre-process puck data in order to trim the player data correctly
+    let (trimmed_puck_coords, starting_pt, cutoff_pt, timesteps) = preprocess_puck(&raw_puck_player_tracking.puck_tracking, goal_details, home_team_id);
+
+    let do_rotate = need_to_rotate(&goal_details, home_team_id);
+
+    let goal_iter;
+    let num_rows_estimate;
+    
+    if cutoff_pt.is_none() {
+        goal_iter = raw_puck_player_tracking.player_tracking[starting_pt..].iter().enumerate();
+        num_rows_estimate = NUM_PLAYERS_ON_ICE_5V5 * raw_puck_player_tracking.player_tracking.len();
+    } else {
+        goal_iter = raw_puck_player_tracking.player_tracking[starting_pt..=cutoff_pt.unwrap()].iter().enumerate();
+        num_rows_estimate = NUM_PLAYERS_ON_ICE_5V5 * (cutoff_pt.unwrap() - starting_pt);
+    }
+
+    // output vectors used to build player loc df
+    let mut goal_ids = Vec::with_capacity(num_rows_estimate);
+    let mut player_timesteps = Vec::with_capacity(num_rows_estimate);
+    let mut player_ids = Vec::with_capacity(num_rows_estimate);
+    let mut team_ids = Vec::with_capacity(num_rows_estimate);
+    let mut xs = Vec::with_capacity(num_rows_estimate);
+    let mut ys = Vec::with_capacity(num_rows_estimate);
+
+    for (i, opt_player_loc_map) in goal_iter {
+        match opt_player_loc_map {
+            Some(player_loc_map) => {
+                // go through all players in the time step and pre-process their 
+                // coordinates                
+                for (player_info, coord) in player_loc_map {
+                    // clamp player data
+                    let clamped_coord = clamp_coord(coord);
+
+                    // rotate coord if needed
+                    let final_coord;
+                    if do_rotate {
+                        final_coord = _rotate_coord(clamped_coord);
+                    } else {
+                        final_coord = Coord{ x: clamped_coord.get_x(), y: clamped_coord.get_y() };
+                    }
+
+                    // update output vecs
+                    goal_ids.push(goal_details.event_id);
+                    player_timesteps.push(i as u32);
+                    player_ids.push(player_info.id);
+                    team_ids.push(player_info.team_id);
+                    xs.push(final_coord.x);
+                    ys.push(final_coord.y);
+                }
+
+            },
+            None => {
+                continue
+            }
+        }
+    }
+
+    PreprocessedPuckPlayerLocationGoalData { 
+        puck_coords: trimmed_puck_coords, 
+        puck_timesteps: timesteps, 
+        goal_ids, 
+        player_timesteps, 
+        player_ids, 
+        team_ids, 
+        xs, 
+        ys 
+    }
 }
 
 /// Uses indices to cut off starting and ending portions of coordinates
@@ -782,6 +984,7 @@ pub fn take_last_n_instances(goal: TrimmedPuckLocations, n: usize) -> TrimmedPuc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // --------------------------------------------------
     // clamp tests
@@ -1097,227 +1300,447 @@ mod tests {
     // read_folder() tests
     // --------------------------------------------------
 
-    // // read in a folder where a game has some missing puck data for some goals
-    // #[test]
-    // fn read_folder_some_missing_puck_data() {
-    //     let test_folder = "test_data/test_folder";
-    //     let mut test_data = PbpGoalLocData {
-    //         goal_loc_data: HashMap::new(),
-    //         pbp_data: HashMap::new()
-    //     };
-    //     read_folder(&test_folder, &mut test_data).unwrap();
+    // read in a folder where a game has some missing puck data for some goals
+    #[test]
+    fn read_folder_some_missing_puck_data() {
+        let test_folder = "test_data/test_folder";
+        let mut test_data = PbpGoalLocData {
+            tracking_type: TrackingType::PuckOnly { goal_loc_data: HashMap::new() },
+            pbp_data: HashMap::new()
+        };
+        read_folder(&test_folder, &mut test_data).unwrap();
 
-    //     // check all games' data: 2024020011
-    //     // play-by-play data
-    //     let pbp_data = &test_data.pbp_data[&GameId(2024020011)];
-    //     assert_eq!(pbp_data.goals.len(), 5);
-    //     assert_eq!(pbp_data.goals[0].event_id, 255);
-    //     assert_eq!(pbp_data.goals[1].event_id, 298);
-    //     assert_eq!(pbp_data.goals[2].event_id, 415);
-    //     assert_eq!(pbp_data.goals[3].event_id, 428);
-    //     assert_eq!(pbp_data.goals[4].event_id, 453);
-    //     assert_eq!(pbp_data.home_team_id, 6);
+        // check all games' data: 2024020011
+        // play-by-play data
+        let pbp_data = &test_data.pbp_data[&GameId(2024020011)];
+        assert_eq!(pbp_data.goals.len(), 5);
+        assert_eq!(pbp_data.goals[0].event_id, 255);
+        assert_eq!(pbp_data.goals[1].event_id, 298);
+        assert_eq!(pbp_data.goals[2].event_id, 415);
+        assert_eq!(pbp_data.goals[3].event_id, 428);
+        assert_eq!(pbp_data.goals[4].event_id, 453);
+        assert_eq!(pbp_data.home_team_id, 6);
 
-    //     assert_eq!(test_data.goal_loc_data[&GameId(2024020011)].len(), 5);
-
-    //     // game 2024020011, goal 255
-    //     // this goal has no puck data, so it should not be in the game's
-    //     // goal data
-    //     assert!(!test_data.goal_loc_data[&GameId(2024020011)].contains_key(&GoalId(255)));
+        // game 2024020011, goal 255
+        // this goal has no puck data, so it should not be in the game's
+        // goal data
+        if let TrackingType::PuckOnly { ref goal_loc_data } = test_data.tracking_type {
+            assert_eq!(goal_loc_data[&GameId(2024020011)].len(), 5);
+            assert!(!goal_loc_data[&GameId(2024020011)].contains_key(&GoalId(255)));
         
-    //     // game 2024020011, goal 298
-    //     // this goal has puck data for every instance
-    //     let goal_298 = &test_data.goal_loc_data[&GameId(2024020011)][&GoalId(298)];
-    //     assert_eq!(goal_298.coords.len(), 5);
+            // game 2024020011, goal 298
+            // this goal has puck data for every instance
+            let goal_298 = &goal_loc_data[&GameId(2024020011)][&GoalId(298)];
+            assert_eq!(goal_298.coords.len(), 5);
+
+            let first_coord = goal_298.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 1145.52);
+            assert_eq!(first_coord.y, 756.8541);
+            
+            let second_coord = goal_298.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 1146.);
+            assert_eq!(second_coord.y, 757.8541);
+
+            let third_coord = goal_298.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 1147.81);
+            assert_eq!(third_coord.y, 758.8541);
+
+            let fourth_coord = goal_298.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 1204.3541);
+            assert_eq!(fourth_coord.y, 759.8541);
+
+            let fifth_coord = goal_298.coords[4].clone().unwrap();
+            assert_eq!(fifth_coord.x, 1145.52);
+            assert_eq!(fifth_coord.y, 777.8541);
+
+            // game 2024020011, goal 415
+            // this goal has some missing puck data at the start        
+            let goal_415 = &goal_loc_data[&GameId(2024020011)][&GoalId(415)];
+            assert_eq!(goal_415.coords.len(), 6);
         
-    //     let first_coord = goal_298.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 1145.52);
-    //     assert_eq!(first_coord.y, 756.8541);
+            let first_coord = goal_415.coords[0].clone();
+            assert!(first_coord.is_none());
+            
+            let second_coord = goal_415.coords[1].clone();
+            assert!(second_coord.is_none());
+
+            let third_coord = goal_415.coords[2].clone();
+            assert!(third_coord.is_none());
+
+            let fourth_coord = goal_415.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 513.4667);
+            assert_eq!(fourth_coord.y, 174.7402);
+
+            let fifth_coord = goal_415.coords[4].clone().unwrap();
+            assert_eq!(fifth_coord.x, 540.4667);
+            assert_eq!(fifth_coord.y, 100.7402);
+
+            let fifth_coord = goal_415.coords[4].clone().unwrap();
+            assert_eq!(fifth_coord.x, 540.4667);
+            assert_eq!(fifth_coord.y, 100.7402);
+
+            let sixth_coord = goal_415.coords[5].clone().unwrap();
+            assert_eq!(sixth_coord.x, 544.4667);
+            assert_eq!(sixth_coord.y, 10.7402);
+
+            // game 2024020011, goal 428
+            // this goal has some missing puck data at the end
+            let goal_428 = &goal_loc_data[&GameId(2024020011)][&GoalId(428)];
+            assert_eq!(goal_428.coords.len(), 6);
         
-    //     let second_coord = goal_298.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 1146.);
-    //     assert_eq!(second_coord.y, 757.8541);
+            let first_coord = goal_428.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 513.4667);
+            assert_eq!(first_coord.y, 174.7402);
+            
+            let second_coord = goal_428.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 523.4667);
+            assert_eq!(second_coord.y, 164.7402);
 
-    //     let third_coord = goal_298.coords[2].clone().unwrap();
-    //     assert_eq!(third_coord.x, 1147.81);
-    //     assert_eq!(third_coord.y, 758.8541);
+            let third_coord = goal_428.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 533.4667);
+            assert_eq!(third_coord.y, 154.7402);
 
-    //     let fourth_coord = goal_298.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 1204.3541);
-    //     assert_eq!(fourth_coord.y, 759.8541);
+            let fourth_coord = goal_428.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 543.4667);
+            assert_eq!(fourth_coord.y, 144.7402);
 
-    //     let fifth_coord = goal_298.coords[4].clone().unwrap();
-    //     assert_eq!(fifth_coord.x, 1145.52);
-    //     assert_eq!(fifth_coord.y, 777.8541);
+            let fifth_coord = goal_428.coords[4].clone();
+            assert!(fifth_coord.is_none());
 
-    //     // game 2024020011, goal 415
-    //     // this goal has some missing puck data at the start
-    //     let goal_415 = &test_data.goal_loc_data[&GameId(2024020011)][&GoalId(415)];
-    //     assert_eq!(goal_415.coords.len(), 6);
+            let sixth_coord = goal_428.coords[5].clone();
+            assert!(sixth_coord.is_none());
+
+            // game 2024020011, goal 453
+            // this goal has some missing puck data in the middle
+            let goal_453 = &goal_loc_data[&GameId(2024020011)][&GoalId(453)];
+            assert_eq!(goal_453.coords.len(), 6);
         
-    //     let first_coord = goal_415.coords[0].clone();
-    //     assert!(first_coord.is_none());
+            let first_coord = goal_453.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 513.4667);
+            assert_eq!(first_coord.y, 174.7402);
+            
+            let second_coord = goal_453.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 523.4667);
+            assert_eq!(second_coord.y, 164.7402);
+
+            let third_coord = goal_453.coords[2].clone();
+            assert!(third_coord.is_none());
+
+            let fourth_coord = goal_453.coords[3].clone();
+            assert!(fourth_coord.is_none());
+
+            let fifth_coord = goal_453.coords[4].clone().unwrap();
+            assert_eq!(fifth_coord.x, 543.4667);
+            assert_eq!(fifth_coord.y, 144.7402, );
+
+            let sixth_coord = goal_453.coords[5].clone().unwrap();
+            assert_eq!(sixth_coord.x, 560.0);
+            assert_eq!(sixth_coord.y, 700.0);
+        };
+
+        // check all games' data: 2024020012
+        // has no goals
+        // play-by-play data
+        let pbp_data = &test_data.pbp_data[&GameId(2024020012)];
+        assert_eq!(pbp_data.goals.len(), 0);
+        assert_eq!(pbp_data.home_team_id, 3);
+
+        // since there are no goal location files for the game, 
+        // the game has no map for the goal data
+        if let TrackingType::PuckOnly { ref goal_loc_data } = test_data.tracking_type {
+            assert!(!goal_loc_data.contains_key(&GameId(2024020012)));
+        }
+
+        // check all games' data: 2024020013
+        // has no goals
+        // play-by-play data
+        let pbp_data = &test_data.pbp_data[&GameId(2024020013)];
+        assert_eq!(pbp_data.goals.len(), 3);
+        assert_eq!(pbp_data.goals[0].event_id, 182);
+        assert_eq!(pbp_data.goals[1].event_id, 311);
+        assert_eq!(pbp_data.goals[2].event_id, 794);
+        assert_eq!(pbp_data.home_team_id, 9);
+
+        if let TrackingType::PuckOnly { ref goal_loc_data } = test_data.tracking_type {
+            assert_eq!(goal_loc_data[&GameId(2024020013)].len(), 3);
+
+            // game 2024020013, goal 182
+            let goal_182 = &goal_loc_data[&GameId(2024020013)][&GoalId(182)];
+            assert_eq!(goal_182.coords.len(), 4);
+            
+            let first_coord = goal_182.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 513.4667);
+            assert_eq!(first_coord.y, 174.7402);
+            
+            let second_coord = goal_182.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 523.4667);
+            assert_eq!(second_coord.y, 164.7402);
+
+            let third_coord = goal_182.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 500.);
+            assert_eq!(third_coord.y, 600.);
+
+            let fourth_coord = goal_182.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 550.);
+            assert_eq!(fourth_coord.y, 610.);
+
+            // game 2024020013, goal 311
+            let goal_311 = &goal_loc_data[&GameId(2024020013)][&GoalId(311)];
+            assert_eq!(goal_311.coords.len(), 4);
+            
+            let first_coord = goal_311.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 1513.4667);
+            assert_eq!(first_coord.y, 174.7402);
+            
+            let second_coord = goal_311.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 1523.4667);
+            assert_eq!(second_coord.y, 164.7402);
+
+            let third_coord = goal_311.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 1500.);
+            assert_eq!(third_coord.y, 600.);
+
+            let fourth_coord = goal_311.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 1550.);
+            assert_eq!(fourth_coord.y, 610.);
+
+            // game 2024020013, goal 794
+            let goal_794 = &goal_loc_data[&GameId(2024020013)][&GoalId(794)];
+            assert_eq!(goal_794.coords.len(), 4);
+            
+            let first_coord = goal_794.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 1513.4667);
+            assert_eq!(first_coord.y, 17.7402);
+            
+            let second_coord = goal_794.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 1523.4667);
+            assert_eq!(second_coord.y, 16.7402);
+
+            let third_coord = goal_794.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 1500.);
+            assert_eq!(third_coord.y, 60.);
+
+            let fourth_coord = goal_794.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 1550.);
+            assert_eq!(fourth_coord.y, 61.);
+        }
+    }
+
+    // read in a folder to get both player and puck data
+    #[test]
+    fn read_folder_some_missing_player_puck_data() {
+        let test_folder = "test_data/test_folder";
+        let mut test_data = PbpGoalLocData {
+            tracking_type: TrackingType::PuckAndPlayer { goal_loc_data: HashMap::new() },
+            pbp_data: HashMap::new()
+        };
+        read_folder(&test_folder, &mut test_data).unwrap();
+
+        // check all games' data: 2024020011
+        // play-by-play data
+        let pbp_data = &test_data.pbp_data[&GameId(2024020011)];
+        assert_eq!(pbp_data.goals.len(), 5);
+        assert_eq!(pbp_data.goals[0].event_id, 255);
+        assert_eq!(pbp_data.goals[1].event_id, 298);
+        assert_eq!(pbp_data.goals[2].event_id, 415);
+        assert_eq!(pbp_data.goals[3].event_id, 428);
+        assert_eq!(pbp_data.goals[4].event_id, 453);
+        assert_eq!(pbp_data.home_team_id, 6);
+
+        // game 2024020011, goal 255
+        // this goal has no puck data, so it should not be in the game's
+        // goal data
+        if let TrackingType::PuckAndPlayer { ref goal_loc_data } = test_data.tracking_type {
+            assert_eq!(goal_loc_data.len(), 2); // there are 2 games with valid data
+            assert_eq!(goal_loc_data[&GameId(2024020011)].len(), 6); // there are 6 goals in this game
+            assert!(goal_loc_data[&GameId(2024020011)].contains_key(&GoalId(255)));
+
+            // game 2024020011, goal 255
+            let goal_255 = &goal_loc_data[&GameId(2024020011)][&GoalId(255)];
+
+            // puck info
+            assert_eq!(goal_255.puck_tracking.coords.len(), 5);
+            assert!(goal_255.puck_tracking.coords[0].is_none());
+            assert!(goal_255.puck_tracking.coords[1].is_none());
+            assert!(goal_255.puck_tracking.coords[2].is_none());
+            assert!(goal_255.puck_tracking.coords[3].is_none());
+            assert!(goal_255.puck_tracking.coords[4].is_none());
+
+            // player info
+            assert_eq!(goal_255.player_tracking.len(), 5); // there are 5 time steps
+
+            // first time step of player info
+            assert_eq!(goal_255.player_tracking[0].clone().unwrap().len(), 11); // there are 11 players
+            let player_8480280_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8480280, team_id: 6}];
+            assert_eq!(player_8480280_1_coord.x, 150.4144);
+            assert_eq!(player_8480280_1_coord.y, 516.8132);
+
+            let player_8480051_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8480051, team_id: 8}];
+            assert_eq!(player_8480051_1_coord.x, 2236.1672);
+            assert_eq!(player_8480051_1_coord.y, 529.4865);
+            let player_8477496_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8477496, team_id: 6}];
+            assert_eq!(player_8477496_1_coord.x, 2000.9888);
+            assert_eq!(player_8477496_1_coord.y, 755.242);
+            let player_8473419_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8473419, team_id: 6}];
+            assert_eq!(player_8473419_1_coord.x, 1997.5461);
+            assert_eq!(player_8473419_1_coord.y, 948.5736);
+            let player_8477989_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8477989, team_id: 8}];
+            assert_eq!(player_8477989_1_coord.x, 2043.1991);
+            assert_eq!(player_8477989_1_coord.y, 752.4976);
+            let player_8475233_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8475233, team_id: 8}];
+            assert_eq!(player_8475233_1_coord.x, 2062.6813);
+            assert_eq!(player_8475233_1_coord.y, 935.107);
+            let player_8476875_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8476875, team_id: 8}];
+            assert_eq!(player_8476875_1_coord.x, 2164.1038);
+            assert_eq!(player_8476875_1_coord.y, 660.754);
+            let player_8476981_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8476981, team_id: 8}];
+            assert_eq!(player_8476981_1_coord.x, 2051.9758);
+            assert_eq!(player_8476981_1_coord.y, 547.9464);
+            let player_8478401_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8478401, team_id: 6}];
+            assert_eq!(player_8478401_1_coord.x, 1961.5559);
+            assert_eq!(player_8478401_1_coord.y, 553.3637);
+            let player_8479325_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8479325, team_id: 6}];
+            assert_eq!(player_8479325_1_coord.x, 1664.6244);
+            assert_eq!(player_8479325_1_coord.y, 921.9213);
+            let player_8477956_1_coord = &goal_255.player_tracking[0].clone().unwrap()[&PlayerInfo{id: 8477956, team_id: 6}];
+            assert_eq!(player_8477956_1_coord.x, 1687.3648);
+            assert_eq!(player_8477956_1_coord.y, 456.4575);
+
+            // second time step of player info
+            assert_eq!(goal_255.player_tracking[1].clone().unwrap().len(), 11); // there are 11 players
         
-    //     let second_coord = goal_415.coords[1].clone();
-    //     assert!(second_coord.is_none());
+            let player_8480280_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8480280, team_id: 6}];
+            assert_eq!(player_8480280_2_coord.x, 151.4144);
+            assert_eq!(player_8480280_2_coord.y, 517.8132);
+            let player_8480051_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8480051, team_id: 8}];
+            assert_eq!(player_8480051_2_coord.x, 2237.1672);
+            assert_eq!(player_8480051_2_coord.y, 528.4865);
+            let player_8477496_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8477496, team_id: 6}];
+            assert_eq!(player_8477496_2_coord.x, 2020.9888);
+            assert_eq!(player_8477496_2_coord.y, 765.242);
+            let player_8473419_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8473419, team_id: 6}];
+            assert_eq!(player_8473419_2_coord.x, 1994.5461);
+            assert_eq!(player_8473419_2_coord.y, 941.5736);
+            let player_8477989_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8477989, team_id: 8}];
+            assert_eq!(player_8477989_2_coord.x, 2041.1991);
+            assert_eq!(player_8477989_2_coord.y, 751.4976);
+            let player_8475233_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8475233, team_id: 8}];
+            assert_eq!(player_8475233_2_coord.x, 2061.6813);
+            assert_eq!(player_8475233_2_coord.y, 944.107);
+            let player_8476875_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8476875, team_id: 8}];
+            assert_eq!(player_8476875_2_coord.x, 2165.1038);
+            assert_eq!(player_8476875_2_coord.y, 668.754);
+            let player_8476981_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8476981, team_id: 8}];
+            assert_eq!(player_8476981_2_coord.x, 2050.9758);
+            assert_eq!(player_8476981_2_coord.y, 548.9464);
+            let player_8478401_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8478401, team_id: 6}];
+            assert_eq!(player_8478401_2_coord.x, 1962.5559);
+            assert_eq!(player_8478401_2_coord.y, 554.3637);
+            let player_8479325_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8479325, team_id: 6}];
+            assert_eq!(player_8479325_2_coord.x, 1665.6244);
+            assert_eq!(player_8479325_2_coord.y, 923.9213);
+            let player_8477956_2_coord = &goal_255.player_tracking[1].clone().unwrap()[&PlayerInfo{id: 8477956, team_id: 6}];
+            assert_eq!(player_8477956_2_coord.x, 1684.3648);
+            assert_eq!(player_8477956_2_coord.y, 459.4575);
 
-    //     let third_coord = goal_415.coords[2].clone();
-    //     assert!(third_coord.is_none());
+            // third time step
+            assert_eq!(goal_255.player_tracking[2].clone().unwrap().len(), 11); // there are 11 players
+            let player_8480280_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8480280, team_id: 6}];
+            assert_eq!(player_8480280_3_coord.x, 149.4144);
+            assert_eq!(player_8480280_3_coord.y, 513.8132);
+            let player_8480051_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8480051, team_id: 8}];
+            assert_eq!(player_8480051_3_coord.x, 2231.1672);
+            assert_eq!(player_8480051_3_coord.y, 528.4865);
+            let player_8477496_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8477496, team_id: 6}];
+            assert_eq!(player_8477496_3_coord.x, 2011.9888);
+            assert_eq!(player_8477496_3_coord.y, 757.242);
+            let player_8473419_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8473419, team_id: 6}];
+            assert_eq!(player_8473419_3_coord.x, 1992.5461);
+            assert_eq!(player_8473419_3_coord.y, 951.5736);
+            let player_8477989_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8477989, team_id: 8}];
+            assert_eq!(player_8477989_3_coord.x, 2049.1991);
+            assert_eq!(player_8477989_3_coord.y, 754.4976);
+            let player_8475233_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8475233, team_id: 8}];
+            assert_eq!(player_8475233_3_coord.x, 2060.6813);
+            assert_eq!(player_8475233_3_coord.y, 931.107);
+            let player_8476875_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8476875, team_id: 8}];
+            assert_eq!(player_8476875_3_coord.x, 2166.1038);
+            assert_eq!(player_8476875_3_coord.y, 661.754);
+            let player_8476981_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8476981, team_id: 8}];
+            assert_eq!(player_8476981_3_coord.x, 2058.9758);
+            assert_eq!(player_8476981_3_coord.y, 543.9464);
+            let player_8478401_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8478401, team_id: 6}];
+            assert_eq!(player_8478401_3_coord.x, 1958.5559);
+            assert_eq!(player_8478401_3_coord.y, 550.3637);
+            let player_8479325_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8479325, team_id: 6}];
+            assert_eq!(player_8479325_3_coord.x, 1663.6244);
+            assert_eq!(player_8479325_3_coord.y, 920.9213);
+            let player_8477956_3_coord = &goal_255.player_tracking[2].clone().unwrap()[&PlayerInfo{id: 8477956, team_id: 6}];
+            assert_eq!(player_8477956_3_coord.x, 1682.3648);
+            assert_eq!(player_8477956_3_coord.y, 457.4575);
 
-    //     let fourth_coord = goal_415.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 513.4667);
-    //     assert_eq!(fourth_coord.y, 174.7402);
+            // fourth time step
+            assert_eq!(goal_255.player_tracking[3].clone().unwrap().len(), 11); // there are 11 players
+            let player_8480280_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8480280, team_id: 6}];
+            assert_eq!(player_8480280_4_coord.x, 147.4144);
+            assert_eq!(player_8480280_4_coord.y, 518.8132);
+            let player_8480051_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8480051, team_id: 8}];
+            assert_eq!(player_8480051_4_coord.x, 2241.1672);
+            assert_eq!(player_8480051_4_coord.y, 531.4865);
+            let player_8477496_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8477496, team_id: 6}];
+            assert_eq!(player_8477496_4_coord.x, 1996.9888);
+            assert_eq!(player_8477496_4_coord.y, 757.242);
+            let player_8473419_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8473419, team_id: 6}];
+            assert_eq!(player_8473419_4_coord.x, 1998.5461);
+            assert_eq!(player_8473419_4_coord.y, 949.5736);
+            let player_8477989_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8477989, team_id: 8}];
+            assert_eq!(player_8477989_4_coord.x, 2046.1991);
+            assert_eq!(player_8477989_4_coord.y, 759.4976);
+            let player_8475233_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8475233, team_id: 8}];
+            assert_eq!(player_8475233_4_coord.x, 2060.6813);
+            assert_eq!(player_8475233_4_coord.y, 936.107);
+            let player_8476875_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8476875, team_id: 8}];
+            assert_eq!(player_8476875_4_coord.x, 2163.1038);
+            assert_eq!(player_8476875_4_coord.y, 661.754);
+            let player_8476981_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8476981, team_id: 8}];
+            assert_eq!(player_8476981_4_coord.x, 2054.9758);
+            assert_eq!(player_8476981_4_coord.y, 548.9464);
+            let player_8478401_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8478401, team_id: 6}];
+            assert_eq!(player_8478401_4_coord.x, 1962.5559);
+            assert_eq!(player_8478401_4_coord.y, 554.3637);
+            let player_8479325_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8479325, team_id: 6}];
+            assert_eq!(player_8479325_4_coord.x, 1666.6244);
+            assert_eq!(player_8479325_4_coord.y, 927.9213);
+            let player_8477956_4_coord = &goal_255.player_tracking[3].clone().unwrap()[&PlayerInfo{id: 8477956, team_id: 6}];
+            assert_eq!(player_8477956_4_coord.x, 1688.3648);
+            assert_eq!(player_8477956_4_coord.y, 459.4575);
 
-    //     let fifth_coord = goal_415.coords[4].clone().unwrap();
-    //     assert_eq!(fifth_coord.x, 540.4667);
-    //     assert_eq!(fifth_coord.y, 100.7402);
+            // game 2024020011, goal 298
+            // this goal has puck data for every instance
+            let goal_298 = &goal_loc_data[&GameId(2024020011)][&GoalId(298)];
+            assert_eq!(goal_298.puck_tracking.coords.len(), 5);
 
-    //     let fifth_coord = goal_415.coords[4].clone().unwrap();
-    //     assert_eq!(fifth_coord.x, 540.4667);
-    //     assert_eq!(fifth_coord.y, 100.7402);
+            let first_coord = goal_298.puck_tracking.coords[0].clone().unwrap();
+            assert_eq!(first_coord.x, 1145.52);
+            assert_eq!(first_coord.y, 756.8541);
+            
+            let second_coord = goal_298.puck_tracking.coords[1].clone().unwrap();
+            assert_eq!(second_coord.x, 1146.);
+            assert_eq!(second_coord.y, 757.8541);
 
-    //     let sixth_coord = goal_415.coords[5].clone().unwrap();
-    //     assert_eq!(sixth_coord.x, 544.4667);
-    //     assert_eq!(sixth_coord.y, 10.7402);
+            let third_coord = goal_298.puck_tracking.coords[2].clone().unwrap();
+            assert_eq!(third_coord.x, 1147.81);
+            assert_eq!(third_coord.y, 758.8541);
 
-    //     // game 2024020011, goal 428
-    //     // this goal has some missing puck data at the end
-    //     let goal_428 = &test_data.goal_loc_data[&GameId(2024020011)][&GoalId(428)];
-    //     assert_eq!(goal_428.coords.len(), 6);
-        
-    //     let first_coord = goal_428.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 513.4667);
-    //     assert_eq!(first_coord.y, 174.7402);
-        
-    //     let second_coord = goal_428.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 523.4667);
-    //     assert_eq!(second_coord.y, 164.7402);
+            let fourth_coord = goal_298.puck_tracking.coords[3].clone().unwrap();
+            assert_eq!(fourth_coord.x, 1204.3541);
+            assert_eq!(fourth_coord.y, 759.8541);
 
-    //     let third_coord = goal_428.coords[2].clone().unwrap();
-    //     assert_eq!(third_coord.x, 533.4667);
-    //     assert_eq!(third_coord.y, 154.7402);
-
-    //     let fourth_coord = goal_428.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 543.4667);
-    //     assert_eq!(fourth_coord.y, 144.7402);
-
-    //     let fifth_coord = goal_428.coords[4].clone();
-    //     assert!(fifth_coord.is_none());
-
-    //     let sixth_coord = goal_428.coords[5].clone();
-    //     assert!(sixth_coord.is_none());
-
-    //     // game 2024020011, goal 453
-    //     // this goal has some missing puck data in the middle
-    //     let goal_453 = &test_data.goal_loc_data[&GameId(2024020011)][&GoalId(453)];
-    //     assert_eq!(goal_453.coords.len(), 6);
-        
-    //     let first_coord = goal_453.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 513.4667);
-    //     assert_eq!(first_coord.y, 174.7402);
-        
-    //     let second_coord = goal_453.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 523.4667);
-    //     assert_eq!(second_coord.y, 164.7402);
-
-    //     let third_coord = goal_453.coords[2].clone();
-    //     assert!(third_coord.is_none());
-
-    //     let fourth_coord = goal_453.coords[3].clone();
-    //     assert!(fourth_coord.is_none());
-
-    //     let fifth_coord = goal_453.coords[4].clone().unwrap();
-    //     assert_eq!(fifth_coord.x, 543.4667);
-    //     assert_eq!(fifth_coord.y, 144.7402, );
-
-    //     let sixth_coord = goal_453.coords[5].clone().unwrap();
-    //     assert_eq!(sixth_coord.x, 560.0);
-    //     assert_eq!(sixth_coord.y, 700.0);
-
-    //     // check all games' data: 2024020012
-    //     // has no goals
-    //     // play-by-play data
-    //     let pbp_data = &test_data.pbp_data[&GameId(2024020012)];
-    //     assert_eq!(pbp_data.goals.len(), 0);
-    //     assert_eq!(pbp_data.home_team_id, 3);
-
-    //     // since there are no goal location files for the game, 
-    //     // the game has no map for the goal data
-    //     assert!(!test_data.goal_loc_data.contains_key(&GameId(2024020012)));
-
-    //     // check all games' data: 2024020013
-    //     // has no goals
-    //     // play-by-play data
-    //     let pbp_data = &test_data.pbp_data[&GameId(2024020013)];
-    //     assert_eq!(pbp_data.goals.len(), 3);
-    //     assert_eq!(pbp_data.goals[0].event_id, 182);
-    //     assert_eq!(pbp_data.goals[1].event_id, 311);
-    //     assert_eq!(pbp_data.goals[2].event_id, 794);
-    //     assert_eq!(pbp_data.home_team_id, 9);
-
-    //     assert_eq!(test_data.goal_loc_data[&GameId(2024020013)].len(), 3);
-
-    //     // game 2024020013, goal 182
-    //     let goal_182 = &test_data.goal_loc_data[&GameId(2024020013)][&GoalId(182)];
-    //     assert_eq!(goal_182.coords.len(), 4);
-        
-    //     let first_coord = goal_182.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 513.4667);
-    //     assert_eq!(first_coord.y, 174.7402);
-        
-    //     let second_coord = goal_182.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 523.4667);
-    //     assert_eq!(second_coord.y, 164.7402);
-
-    //     let third_coord = goal_182.coords[2].clone().unwrap();
-    //     assert_eq!(third_coord.x, 500.);
-    //     assert_eq!(third_coord.y, 600.);
-
-    //     let fourth_coord = goal_182.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 550.);
-    //     assert_eq!(fourth_coord.y, 610.);
-
-    //     // game 2024020013, goal 311
-    //     let goal_311 = &test_data.goal_loc_data[&GameId(2024020013)][&GoalId(311)];
-    //     assert_eq!(goal_311.coords.len(), 4);
-        
-    //     let first_coord = goal_311.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 1513.4667);
-    //     assert_eq!(first_coord.y, 174.7402);
-        
-    //     let second_coord = goal_311.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 1523.4667);
-    //     assert_eq!(second_coord.y, 164.7402);
-
-    //     let third_coord = goal_311.coords[2].clone().unwrap();
-    //     assert_eq!(third_coord.x, 1500.);
-    //     assert_eq!(third_coord.y, 600.);
-
-    //     let fourth_coord = goal_311.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 1550.);
-    //     assert_eq!(fourth_coord.y, 610.);
-
-    //     // game 2024020013, goal 794
-    //     let goal_794 = &test_data.goal_loc_data[&GameId(2024020013)][&GoalId(794)];
-    //     assert_eq!(goal_794.coords.len(), 4);
-        
-    //     let first_coord = goal_794.coords[0].clone().unwrap();
-    //     assert_eq!(first_coord.x, 1513.4667);
-    //     assert_eq!(first_coord.y, 17.7402);
-        
-    //     let second_coord = goal_794.coords[1].clone().unwrap();
-    //     assert_eq!(second_coord.x, 1523.4667);
-    //     assert_eq!(second_coord.y, 16.7402);
-
-    //     let third_coord = goal_794.coords[2].clone().unwrap();
-    //     assert_eq!(third_coord.x, 1500.);
-    //     assert_eq!(third_coord.y, 60.);
-
-    //     let fourth_coord = goal_794.coords[3].clone().unwrap();
-    //     assert_eq!(fourth_coord.x, 1550.);
-    //     assert_eq!(fourth_coord.y, 61.);
-    // }
-
+            let fifth_coord = goal_298.puck_tracking.coords[4].clone().unwrap();
+            assert_eq!(fifth_coord.x, 1145.52);
+            assert_eq!(fifth_coord.y, 777.8541);
+        }
+    }
     // --------------------------------------------------
     // rotate_goal_coords() tests
     // --------------------------------------------------
@@ -2629,7 +3052,7 @@ mod tests {
         ]);
     }
 
-        // multiple timestamps missing puck location
+    // multiple timestamps missing puck location
     #[test]
     fn subset_coords_many_missing() {
         let rot_goal = RotatedPuckLocations { coords: vec![
@@ -3105,5 +3528,1102 @@ mod tests {
             Coord { x: 6., y: 6. },
         ] };
         assert_eq!(rslt, expected_rslt);
+    }
+
+    // --------------------------------------------------
+    // read_puck_player_loc_data() tests
+    // --------------------------------------------------
+    
+    // all instances have player and puck data
+    #[test]
+    fn read_puck_player_loc_no_missing() {
+        let test_path = "test_data/test_player_puck_data/two_timesteps.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 2);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        let second_coord = puck_player_data.puck_tracking.coords[1].clone().unwrap();
+        assert_eq!(second_coord.x, 1930.8914);
+        assert_eq!(second_coord.y, 1000.7894);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 2); // 2 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+    }
+
+    // empty json
+    #[test]
+    fn read_puck_player_loc_empty() {
+        let test_path = "test_data/test_player_puck_data/empty.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 0);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 0);
+    }
+    
+    // one time step is missing puck data
+    #[test]
+    fn read_puck_player_loc_one_puck_missing() {
+        let test_path = "test_data/test_player_puck_data/one_puck_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 3);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        assert!(puck_player_data.puck_tracking.coords[1].is_none());
+
+        let first_coord = puck_player_data.puck_tracking.coords[2].clone().unwrap();
+        assert_eq!(first_coord.x, 1930.8914);
+        assert_eq!(first_coord.y, 1000.7894);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 3); // 3 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+        
+        let third_players_map = puck_player_data.player_tracking[2].as_ref().unwrap().clone();
+        assert_eq!(third_players_map.len(), 3);
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1243.7433, y: 28.8583 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2234.1698, y: 547.4442 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1836.6556, y: 394.1464 });
+    }
+
+    // two time steps are missing puck data
+    #[test]
+    fn read_puck_player_loc_two_puck_missing() {
+        let test_path = "test_data/test_player_puck_data/two_puck_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 4);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        assert!(puck_player_data.puck_tracking.coords[1].is_none());
+
+        let third_coord = puck_player_data.puck_tracking.coords[2].clone().unwrap();
+        assert_eq!(third_coord.x, 1930.8914);
+        assert_eq!(third_coord.y, 1000.7894);
+
+        assert!(puck_player_data.puck_tracking.coords[3].is_none());
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 4); // 4 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+        
+        let third_players_map = puck_player_data.player_tracking[2].as_ref().unwrap().clone();
+        assert_eq!(third_players_map.len(), 3);
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1243.7433, y: 28.8583 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2234.1698, y: 547.4442 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1836.6556, y: 394.1464 });
+
+        let fourth_players_map = puck_player_data.player_tracking[3].as_ref().unwrap().clone();
+        assert_eq!(fourth_players_map.len(), 2);
+        assert_eq!(fourth_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1244.7433, y: 29.8583 });
+        assert_eq!(fourth_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2235.1698, y: 548.4442 });
+    }
+
+    // all time steps are missing puck data
+    #[test]
+    fn read_puck_player_loc_all_puck_missing() {
+        let test_path = "test_data/test_player_puck_data/all_puck_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 4);
+        assert!(puck_player_data.puck_tracking.coords[0].is_none());
+        assert!(puck_player_data.puck_tracking.coords[1].is_none());
+        assert!(puck_player_data.puck_tracking.coords[2].is_none());
+        assert!(puck_player_data.puck_tracking.coords[3].is_none());
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 4); // 4 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+        
+        let third_players_map = puck_player_data.player_tracking[2].as_ref().unwrap().clone();
+        assert_eq!(third_players_map.len(), 3);
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1243.7433, y: 28.8583 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2234.1698, y: 547.4442 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1836.6556, y: 394.1464 });
+
+        let fourth_players_map = puck_player_data.player_tracking[3].as_ref().unwrap().clone();
+        assert_eq!(fourth_players_map.len(), 2);
+        assert_eq!(fourth_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1244.7433, y: 29.8583 });
+        assert_eq!(fourth_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2235.1698, y: 548.4442 });
+    }
+
+    // one time step is missing all player info
+    #[test]
+    fn read_puck_player_loc_one_player_missing() {
+        let test_path = "test_data/test_player_puck_data/one_player_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 3);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        let second_coord = puck_player_data.puck_tracking.coords[1].clone().unwrap();
+        assert_eq!(second_coord.x, 1931.8914);
+        assert_eq!(second_coord.y, 1004.7894);
+
+        let third_coord = puck_player_data.puck_tracking.coords[2].clone().unwrap();
+        assert_eq!(third_coord.x, 1930.8914);
+        assert_eq!(third_coord.y, 1000.7894);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 3); // 3 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+        
+        assert!(puck_player_data.player_tracking[2].is_none());
+    }
+
+    // multiple time steps are missing all player info
+    #[test]
+    fn read_puck_player_loc_multi_player_missing() {
+        let test_path = "test_data/test_player_puck_data/multi_player_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 3);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        let second_coord = puck_player_data.puck_tracking.coords[1].clone().unwrap();
+        assert_eq!(second_coord.x, 1931.8914);
+        assert_eq!(second_coord.y, 1004.7894);
+
+        let third_coord = puck_player_data.puck_tracking.coords[2].clone().unwrap();
+        assert_eq!(third_coord.x, 1930.8914);
+        assert_eq!(third_coord.y, 1000.7894);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 3); // 3 time steps
+        assert!(puck_player_data.player_tracking[0].is_none());
+
+        let second_players_map = puck_player_data.player_tracking[1].as_ref().unwrap().clone();
+        assert_eq!(second_players_map.len(), 5);
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1242.7433, y: 27.8583 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2233.1698, y: 546.4442 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1348.0141, y: 80.8799 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2050.3707, y: 940.3689 });
+        assert_eq!(second_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1835.6556, y: 393.1464 });
+        
+        assert!(puck_player_data.player_tracking[2].is_none());
+    }
+
+    // all time steps are missing all player info
+    #[test]
+    fn read_puck_player_loc_all_player_missing() {
+        let test_path = "test_data/test_player_puck_data/all_player_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 3);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        let second_coord = puck_player_data.puck_tracking.coords[1].clone().unwrap();
+        assert_eq!(second_coord.x, 1931.8914);
+        assert_eq!(second_coord.y, 1004.7894);
+
+        let third_coord = puck_player_data.puck_tracking.coords[2].clone().unwrap();
+        assert_eq!(third_coord.x, 1930.8914);
+        assert_eq!(third_coord.y, 1000.7894);
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 3); // 3 time steps
+        assert!(puck_player_data.player_tracking[0].is_none());
+        assert!(puck_player_data.player_tracking[1].is_none());
+        assert!(puck_player_data.player_tracking[2].is_none());
+    }
+
+    // missing both puck and player data for some timesteps
+    #[test]
+    fn read_puck_player_loc_puck_player_missing() {
+        let test_path = "test_data/test_player_puck_data/some_puck_player_missing.json";
+        let puck_player_data = read_puck_player_loc_data(&test_path).unwrap();
+
+        // puck data
+        assert_eq!(puck_player_data.puck_tracking.coords.len(), 4);
+        let first_coord = puck_player_data.puck_tracking.coords[0].clone().unwrap();
+        assert_eq!(first_coord.x, 1932.8914);
+        assert_eq!(first_coord.y, 1008.7894);
+
+        let second_coord = puck_player_data.puck_tracking.coords[1].clone().unwrap();
+        assert_eq!(second_coord.x, 1931.8914);
+        assert_eq!(second_coord.y, 1004.7894);
+
+        assert!(puck_player_data.puck_tracking.coords[2].is_none());
+        assert!(puck_player_data.puck_tracking.coords[3].is_none());
+
+        // player data
+        assert_eq!(puck_player_data.player_tracking.len(), 4); // 4 time steps
+        let first_players_map = puck_player_data.player_tracking[0].as_ref().unwrap().clone();
+        assert_eq!(first_players_map.len(), 5);
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1241.7433, y: 26.8583 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2232.1698, y: 545.4442 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8475179, team_id: 13 }], Coord{ x: 1347.0141, y: 77.8799 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8482113, team_id: 13 }], Coord{ x: 2044.3707, y: 904.3689 });
+        assert_eq!(first_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1832.6556, y: 390.1464 });
+
+        assert!(puck_player_data.player_tracking[1].is_none());
+        
+        let third_players_map = puck_player_data.player_tracking[2].as_ref().unwrap().clone();
+        assert_eq!(third_players_map.len(), 3);
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8473507, team_id: 13 }], Coord{ x: 1243.7433, y: 28.8583 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8481519, team_id: 16 }], Coord{ x: 2234.1698, y: 547.4442 });
+        assert_eq!(third_players_map[&PlayerInfo{ id: 8484783, team_id: 16 }], Coord{ x: 1836.6556, y: 394.1464 });
+
+        assert!(puck_player_data.player_tracking[3].is_none());
+    }
+
+    // -------------------------------------------
+    // preprocess_player_puck() tests
+    // -------------------------------------------
+
+    // neither the puck nor player location data needs to be rotated nor trimmed
+    #[test]
+    fn preprocess_player_puck_passthr() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                Some(Coord{ x: 10.1211, y: 50.6584 }),
+                Some(Coord{ x: 11.1211, y: 52.6584 }),
+                Some(Coord{ x: 12.1211, y: 54.6584 }),
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 10.1211, y: 50.6584 });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 11.1211, y: 52.6584 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 12.1211, y: 54.6584 });
+
+        assert_eq!(result.player_timesteps.len(), 9);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 9);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (507.2463, 932.2318)); // first timestep
+        assert_eq!(result_map[&(12, 0, 8481518, 16)], (160.1699, 543.0000)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (499.9477, 631.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (506.2463, 931.2318)); // second timestep
+        assert_eq!(result_map[&(12, 1, 8481518, 16)], (161.1699, 544.5953)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (500.9477, 632.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (505.2463, 930.2318)); // third timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (865.6758, 891.0598)); // different player
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (501.9477, 633.1628)); 
+    }
+
+    // rotated goal
+    #[test]
+    fn preprocess_player_puck_rotated() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                Some(Coord{ x: 10.1211, y: 50.6584 }),
+                Some(Coord{ x: 11.1211, y: 52.6584 }),
+                Some(Coord{ x: 12.1211, y: 54.6584 }),
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507., y: 932. });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160., y: 543. });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499., y: 631. });
+
+        let mut player_map_2 = HashMap::new(); // second timestep
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506., y: 931. });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161., y: 544. });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500., y: 632. });
+
+        let mut player_map_3 = HashMap::new(); // third timestep
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505., y: 930. });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865., y: 891. });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501., y: 633. });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Right") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2389.8789, y: 964.3416 });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2388.8789, y: 962.3416 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2387.8789, y: 960.3416 });
+
+        assert_eq!(result.player_timesteps.len(), 9);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 9);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (1893.0, 83.0)); // first timestep
+        assert_eq!(result_map[&(12, 0, 8481518, 16)], (2240.0, 472.0)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (1901.0, 384.0)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (1894.0, 84.0)); // second timestep
+        assert_eq!(result_map[&(12, 1, 8481518, 16)], (2239.0, 471.0)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (1900.0, 383.0)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (1895.0, 85.0)); // third timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (1535.0, 124.0)); // different player
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (1899.0, 382.0)); 
+    }
+
+    // goal trimmed at the end
+    #[test]
+    fn preprocess_player_puck_trimmed_end() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                Some(Coord { x: 1010.5, y: 900.5 }),
+                Some(Coord { x: 2019.9, y: 776.4 }),
+                Some(Coord { x: 2250.4, y: 500.1444 }), // enters here and should be trimmed here
+                Some(Coord { x: 2020.3, y: 775.6 }),
+                Some(Coord { x: 11., y: 11. }),
+
+                Some(Coord { x: 12., y: 11. }),
+                Some(Coord { x: 13., y: 11. }),
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let mut player_map_4 = HashMap::new(); // fourth timestep, won't be included in result
+        player_map_4.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 504.2463, y: 929.2318 });
+        player_map_4.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 866.6758, y: 892.0598 });
+        player_map_4.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 502.9477, y: 634.1628 });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+            Some(player_map_4),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 1010.5, y: 900.5 });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2019.9, y: 776.4 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2250.4, y: 500.1444 });
+
+        assert_eq!(result.player_timesteps.len(), 9);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 9);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (507.2463, 932.2318)); // first timestep
+        assert_eq!(result_map[&(12, 0, 8481518, 16)], (160.1699, 543.0000)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (499.9477, 631.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (506.2463, 931.2318)); // second timestep
+        assert_eq!(result_map[&(12, 1, 8481518, 16)], (161.1699, 544.5953)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (500.9477, 632.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (505.2463, 930.2318)); // third timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (865.6758, 891.0598)); // different player
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (501.9477, 633.1628)); 
+    }
+
+    // goal trimmed at the start
+    #[test]
+    fn preprocess_player_puck_trimmed_start() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                Some(Coord { x: 955., y: 210.2 }),
+                Some(Coord { x: 955.4, y: 210.4 }),
+                Some(Coord { x: 955.3, y: 210.3 }),
+                Some(Coord { x: 955.2, y: 210.1 }),
+                Some(Coord { x: 11., y: 11. }), // starts here
+
+                Some(Coord { x: 12., y: 11. }),
+                Some(Coord { x: 13., y: 11. }),
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep, won't be included in result
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep, won't be included in result
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep, won't be included in result
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let mut player_map_4 = HashMap::new(); // fourth timestep, won't be included in result
+        player_map_4.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 504.2463, y: 929.2318 });
+        player_map_4.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 866.6758, y: 892.0598 });
+        player_map_4.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 502.9477, y: 634.1628 });
+
+        let mut player_map_5 = HashMap::new(); // fifth timestep
+        player_map_5.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 503.2463, y: 928.2318 });
+        player_map_5.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 867.6758, y: 893.0598 });
+        player_map_5.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 503.9477, y: 635.1628 });
+
+        let mut player_map_6 = HashMap::new(); // sixth timestep
+        player_map_6.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 502.2463, y: 927.2318 });
+        player_map_6.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 868.6758, y: 894.0598 });
+        player_map_6.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 504.9477, y: 636.1628 });
+
+        let mut player_map_7 = HashMap::new(); // seventh timestep
+        player_map_7.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 501.2463, y: 926.2318 });
+        player_map_7.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 869.6758, y: 895.0598 });
+        player_map_7.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 505.9477, y: 637.1628 });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+            Some(player_map_4),
+            Some(player_map_5),
+            Some(player_map_6),
+            Some(player_map_7),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 11., y: 11. });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 12., y: 11. });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 13., y: 11. });
+
+        assert_eq!(result.player_timesteps.len(), 9);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 9);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (503.2463, 928.2318)); // fifth timestep
+        assert_eq!(result_map[&(12, 0, 8481520, 16)], (867.6758, 893.0598)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (503.9477, 635.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (502.2463, 927.2318)); // sixth timestep
+        assert_eq!(result_map[&(12, 1, 8481520, 16)], (868.6758, 894.0598)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (504.9477, 636.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (501.2463, 926.2318)); // seventh timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (869.6758, 895.0598)); 
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (505.9477, 637.1628)); 
+    }
+
+    // trimmed at start and end
+    #[test]
+    fn preprocess_player_puck_trimmed_start_end() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                Some(Coord { x: 2035.4955, y: 216.197 }),
+                Some(Coord { x: 2035.8623, y: 218.187 }),
+                Some(Coord { x: 2035.8621, y: 218.186 }),
+                Some(Coord { x: 2019.4606, y: 247.9944 }), // starts here
+                Some(Coord { x: 2028.5012, y: 269.7925 }),
+
+                Some(Coord { x: 2021.4669, y: 270.5219 }),
+                Some(Coord { x: 2173.5117, y: 418.5711 }),
+                Some(Coord { x: 2172.869, y: 423.4482 }),
+                Some(Coord { x: 2250.2745, y: 483.4997 }),  // enters goal here
+                Some(Coord { x: 2250.2745, y: 484.4997 }), 
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep, won't be included in result
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep, won't be included in result
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep, won't be included in result
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let mut player_map_4 = HashMap::new(); // fourth timestep
+        player_map_4.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 504.2463, y: 929.2318 });
+        player_map_4.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 866.6758, y: 892.0598 });
+        player_map_4.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 502.9477, y: 634.1628 });
+
+        let mut player_map_5 = HashMap::new(); // fifth timestep
+        player_map_5.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 503.2463, y: 928.2318 });
+        player_map_5.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 867.6758, y: 893.0598 });
+        player_map_5.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 503.9477, y: 635.1628 });
+
+        let mut player_map_6 = HashMap::new(); // sixth timestep
+        player_map_6.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 502.2463, y: 927.2318 });
+        player_map_6.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 868.6758, y: 894.0598 });
+        player_map_6.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 504.9477, y: 636.1628 });
+
+        let mut player_map_7 = HashMap::new(); // seventh timestep
+        player_map_7.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 501.2463, y: 926.2318 });
+        player_map_7.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 869.6758, y: 895.0598 });
+        player_map_7.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 505.9477, y: 637.1628 });
+
+        let mut player_map_8 = HashMap::new(); // eight timestep
+        player_map_8.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 500.2463, y: 925.2318 });
+        player_map_8.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 870.6758, y: 896.0598 });
+        player_map_8.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 506.9477, y: 638.1628 });
+
+        let mut player_map_9 = HashMap::new(); // ninth timestep
+        player_map_9.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 499.2463, y: 924.2318 });
+        player_map_9.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 871.6758, y: 897.0598 });
+        player_map_9.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 507.9477, y: 639.1628 });
+
+        let mut player_map_10 = HashMap::new(); // tenth timestep, won't be included in result
+        player_map_10.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 498.2463, y: 923.2318 });
+        player_map_10.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 872.6758, y: 898.0598 });
+        player_map_10.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 508.9477, y: 640.1628 });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+            Some(player_map_4),
+            Some(player_map_5),
+            Some(player_map_6),
+            Some(player_map_7),
+            Some(player_map_8),
+            Some(player_map_9),
+            Some(player_map_10),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        
+        assert_eq!(result.puck_coords.coords.len(), 6);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2, 3, 4, 5
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2019.4606, y: 247.9944 });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2028.5012, y: 269.7925 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2021.4669, y: 270.5219 });
+        assert_eq!(result.puck_coords.coords[3], Coord{ x: 2173.5117, y: 418.5711 });
+        assert_eq!(result.puck_coords.coords[4], Coord{ x: 2172.869, y: 423.4482 });
+        assert_eq!(result.puck_coords.coords[5], Coord{ x: 2250.2745, y: 483.4997 });
+
+        assert_eq!(result.player_timesteps.len(), 18);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 18);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (504.2463, 929.2318)); // fourth timestep
+        assert_eq!(result_map[&(12, 0, 8481520, 16)], (866.6758, 892.0598)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (502.9477, 634.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (503.2463, 928.2318)); // fifth timestep
+        assert_eq!(result_map[&(12, 1, 8481520, 16)], (867.6758, 893.0598)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (503.9477, 635.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (502.2463, 927.2318)); // sixth timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (868.6758, 894.0598)); 
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (504.9477, 636.1628)); 
+
+        assert_eq!(result_map[&(12, 3, 8481519, 16)], (501.2463, 926.2318)); // seventh timestep
+        assert_eq!(result_map[&(12, 3, 8481520, 16)], (869.6758, 895.0598)); 
+        assert_eq!(result_map[&(12, 3, 8473419, 11)], (505.9477, 637.1628));
+
+        assert_eq!(result_map[&(12, 4, 8481519, 16)], (500.2463, 925.2318)); // eighth timestep
+        assert_eq!(result_map[&(12, 4, 8481520, 16)], (870.6758, 896.0598)); 
+        assert_eq!(result_map[&(12, 4, 8473419, 11)], (506.9477, 638.1628));
+
+        assert_eq!(result_map[&(12, 5, 8481519, 16)], (499.2463, 924.2318)); // ninth timestep
+        assert_eq!(result_map[&(12, 5, 8481520, 16)], (871.6758, 897.0598)); 
+        assert_eq!(result_map[&(12, 5, 8473419, 11)], (507.9477, 639.1628));
+    }
+
+    // some timesteps are missing puck data
+    #[test]
+    fn preprocess_player_puck_nones() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                None,
+                None,
+                Some(Coord { x: 11., y: 12. }),
+                None,
+                Some(Coord { x: 2021.4669, y: 270.5219 }),
+
+                Some(Coord { x: 2173.5117, y: 418.5711 }),
+                None,
+                
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep, won't be in result
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep, won't be in result
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let mut player_map_4 = HashMap::new(); // fourth timestep
+        player_map_4.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 504.2463, y: 929.2318 });
+        player_map_4.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 866.6758, y: 892.0598 });
+        player_map_4.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 502.9477, y: 634.1628 });
+
+        let mut player_map_5 = HashMap::new(); // fifth timestep
+        player_map_5.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 503.2463, y: 928.2318 });
+        player_map_5.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 867.6758, y: 893.0598 });
+        player_map_5.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 503.9477, y: 635.1628 });
+
+        let mut player_map_6 = HashMap::new(); // sixth timestep
+        player_map_6.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 502.2463, y: 927.2318 });
+        player_map_6.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 868.6758, y: 894.0598 });
+        player_map_6.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 504.9477, y: 636.1628 });
+
+        let mut player_map_7 = HashMap::new(); // seventh timestep
+        player_map_7.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 501.2463, y: 926.2318 });
+        player_map_7.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 869.6758, y: 895.0598 });
+        player_map_7.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 505.9477, y: 637.1628 });
+
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+            Some(player_map_4),
+            Some(player_map_5),
+            Some(player_map_6),
+            Some(player_map_7),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+
+        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 2, 3
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 11., y: 12. });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2021.4669, y: 270.5219 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2173.5117, y: 418.5711 });
+
+        assert_eq!(result.player_timesteps.len(), 15);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 15);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (505.2463, 930.2318)); // third timestep
+        assert_eq!(result_map[&(12, 0, 8481520, 16)], (865.6758, 891.0598)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (501.9477, 633.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (504.2463, 929.2318)); // fourth timestep
+        assert_eq!(result_map[&(12, 1, 8481520, 16)], (866.6758, 892.0598)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (502.9477, 634.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (503.2463, 928.2318)); // fifth timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (867.6758, 893.0598)); 
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (503.9477, 635.1628)); 
+
+        assert_eq!(result_map[&(12, 3, 8481519, 16)], (502.2463, 927.2318)); // sixth timestep
+        assert_eq!(result_map[&(12, 3, 8481520, 16)], (868.6758, 894.0598)); 
+        assert_eq!(result_map[&(12, 3, 8473419, 11)], (504.9477, 636.1628));
+
+        assert_eq!(result_map[&(12, 4, 8481519, 16)], (501.2463, 926.2318)); // seventh timestep
+        assert_eq!(result_map[&(12, 4, 8481520, 16)], (869.6758, 895.0598)); 
+        assert_eq!(result_map[&(12, 4, 8473419, 11)], (505.9477, 637.1628));
+    }
+
+    // trimmed and has missing puck info
+    #[test]
+    fn preprocess_player_puck_trimmed_nones() {
+        let puck_tracking = RawPuckLocationData{ coords: 
+            vec![
+                None,
+                Some(Coord { x: 2035.8623, y: 218.187 }),
+                None,
+                Some(Coord { x: 2019.4606, y: 247.9944 }), // starts here
+                Some(Coord { x: 2028.5012, y: 269.7925 }),
+
+                Some(Coord { x: 2021.4669, y: 270.5219 }),
+                None,
+                Some(Coord { x: 2172.869, y: 423.4482 }),
+                Some(Coord { x: 2250.2745, y: 483.4997 }),  // enters goal here
+                Some(Coord { x: 2250.2745, y: 484.4997 }), 
+            ]
+        };
+        let mut player_map_1 = HashMap::new(); // first timestep, won't be included in result
+        player_map_1.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 507.2463, y: 932.2318 });
+        player_map_1.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 160.1699, y: 543.0000 });
+        player_map_1.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 499.9477, y: 631.1628 });
+
+        let mut player_map_2 = HashMap::new(); // second timestep, won't be included in result
+        player_map_2.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 506.2463, y: 931.2318 });
+        player_map_2.insert(PlayerInfo{ id: 8481518, team_id: 16 }, Coord{ x: 161.1699, y: 544.5953 });
+        player_map_2.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 500.9477, y: 632.1628 });
+
+        let mut player_map_3 = HashMap::new(); // third timestep, won't be included in result
+        player_map_3.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 505.2463, y: 930.2318 });
+        player_map_3.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 865.6758, y: 891.0598 });
+        player_map_3.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 501.9477, y: 633.1628 });
+
+        let mut player_map_4 = HashMap::new(); // fourth timestep
+        player_map_4.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 504.2463, y: 929.2318 });
+        player_map_4.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 866.6758, y: 892.0598 });
+        player_map_4.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 502.9477, y: 634.1628 });
+
+        let mut player_map_5 = HashMap::new(); // fifth timestep
+        player_map_5.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 503.2463, y: 928.2318 });
+        player_map_5.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 867.6758, y: 893.0598 });
+        player_map_5.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 503.9477, y: 635.1628 });
+
+        let mut player_map_6 = HashMap::new(); // sixth timestep
+        player_map_6.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 502.2463, y: 927.2318 });
+        player_map_6.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 868.6758, y: 894.0598 });
+        player_map_6.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 504.9477, y: 636.1628 });
+
+        let mut player_map_7 = HashMap::new(); // seventh timestep
+        player_map_7.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 501.2463, y: 926.2318 });
+        player_map_7.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 869.6758, y: 895.0598 });
+        player_map_7.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 505.9477, y: 637.1628 });
+
+        let mut player_map_8 = HashMap::new(); // eight timestep
+        player_map_8.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 500.2463, y: 925.2318 });
+        player_map_8.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 870.6758, y: 896.0598 });
+        player_map_8.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 506.9477, y: 638.1628 });
+
+        let mut player_map_9 = HashMap::new(); // ninth timestep
+        player_map_9.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 499.2463, y: 924.2318 });
+        player_map_9.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 871.6758, y: 897.0598 });
+        player_map_9.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 507.9477, y: 639.1628 });
+
+        let mut player_map_10 = HashMap::new(); // tenth timestep, won't be included in result
+        player_map_10.insert(PlayerInfo{ id: 8481519, team_id: 16 }, Coord{ x: 498.2463, y: 923.2318 });
+        player_map_10.insert(PlayerInfo{ id: 8481520, team_id: 16 }, Coord{ x: 872.6758, y: 898.0598 });
+        player_map_10.insert(PlayerInfo{ id: 8473419, team_id: 11 }, Coord{ x: 508.9477, y: 640.1628 });
+
+        let player_tracking = vec![
+            Some(player_map_1),
+            Some(player_map_2),
+            Some(player_map_3),
+            Some(player_map_4),
+            Some(player_map_5),
+            Some(player_map_6),
+            Some(player_map_7),
+            Some(player_map_8),
+            Some(player_map_9),
+            Some(player_map_10),
+        ];
+        let raw_puck_player_tracking = GoalRawPuckPlayerData { 
+            puck_tracking, 
+            player_tracking
+        };
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
+        
+        assert_eq!(result.puck_coords.coords.len(), 5);
+        assert_eq!(result.puck_timesteps, vec![
+            0, 1, 2, 4, 5
+        ]);
+        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2019.4606, y: 247.9944 });
+        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2028.5012, y: 269.7925 });
+        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2021.4669, y: 270.5219 });
+        assert_eq!(result.puck_coords.coords[3], Coord{ x: 2172.869, y: 423.4482 });
+        assert_eq!(result.puck_coords.coords[4], Coord{ x: 2250.2745, y: 483.4997 });
+
+        assert_eq!(result.player_timesteps.len(), 18);
+        
+        // to check output, use a hash set for each "row" of info
+        let mut result_map = HashMap::new();
+        for i in 0..result.goal_ids.len() {
+            result_map.insert((
+                result.goal_ids[i],
+                result.player_timesteps[i],
+                result.player_ids[i],
+                result.team_ids[i],
+            ), (result.xs[i], result.ys[i])
+        );
+        }
+        
+        assert_eq!(result_map.len(), 18);
+        assert_eq!(result_map[&(12, 0, 8481519, 16)], (504.2463, 929.2318)); // fourth timestep
+        assert_eq!(result_map[&(12, 0, 8481520, 16)], (866.6758, 892.0598)); 
+        assert_eq!(result_map[&(12, 0, 8473419, 11)], (502.9477, 634.1628)); 
+
+        assert_eq!(result_map[&(12, 1, 8481519, 16)], (503.2463, 928.2318)); // fifth timestep
+        assert_eq!(result_map[&(12, 1, 8481520, 16)], (867.6758, 893.0598)); 
+        assert_eq!(result_map[&(12, 1, 8473419, 11)], (503.9477, 635.1628)); 
+
+        assert_eq!(result_map[&(12, 2, 8481519, 16)], (502.2463, 927.2318)); // sixth timestep
+        assert_eq!(result_map[&(12, 2, 8481520, 16)], (868.6758, 894.0598)); 
+        assert_eq!(result_map[&(12, 2, 8473419, 11)], (504.9477, 636.1628)); 
+
+        assert_eq!(result_map[&(12, 3, 8481519, 16)], (501.2463, 926.2318)); // seventh timestep
+        assert_eq!(result_map[&(12, 3, 8481520, 16)], (869.6758, 895.0598)); 
+        assert_eq!(result_map[&(12, 3, 8473419, 11)], (505.9477, 637.1628));
+
+        assert_eq!(result_map[&(12, 4, 8481519, 16)], (500.2463, 925.2318)); // eighth timestep
+        assert_eq!(result_map[&(12, 4, 8481520, 16)], (870.6758, 896.0598)); 
+        assert_eq!(result_map[&(12, 4, 8473419, 11)], (506.9477, 638.1628));
+
+        assert_eq!(result_map[&(12, 5, 8481519, 16)], (499.2463, 924.2318)); // ninth timestep
+        assert_eq!(result_map[&(12, 5, 8481520, 16)], (871.6758, 897.0598)); 
+        assert_eq!(result_map[&(12, 5, 8473419, 11)], (507.9477, 639.1628));
+    }
+
+    // ------------------------------------
+    // need_to_rotate() tests
+    // ------------------------------------
+
+    // don't need to rotate
+    #[test]
+    fn need_to_rotate_false() {
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Left") 
+        };
+        let home_team_id = 16;
+        let result = need_to_rotate(&goal_details, home_team_id);
+        assert!(!result);
+    }
+
+    // need to rotate
+    #[test]
+    fn need_to_rotate_true() {
+        let goal_details = GoalDetails { 
+            event_id: 12, ppt_replay_url: None, scoring_team_id: 16, home_team_defending_side: String::from("Right") 
+        };
+        let home_team_id = 16;
+        let result = need_to_rotate(&goal_details, home_team_id);
+        assert!(result);
     }
 }
