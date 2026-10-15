@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs::{File, read_dir};
 use std::io::BufReader;
+use std::iter::zip;
 use std::path::Path;
 
 use clamped_coord::{clamp_coord, ClampedCoord};
@@ -412,7 +413,7 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
                                     }
                                 };
                             },
-                            // TODO: call new read_puck_player_loc_data()
+                            
                             TrackingType::PuckAndPlayer { goal_loc_data } => {
                                 let loc_data = match read_puck_player_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
                                     Ok(ld) => ld,
@@ -850,16 +851,20 @@ pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &G
 }
 
 /// Pre-processed puck and player location data for a single goal
-struct PreprocessedPuckPlayerLocationGoalData {
-    puck_coords: TrimmedPuckLocations,
-    puck_timesteps: Vec<usize>,
-    goal_ids: Vec<u32>,
+pub struct PreprocessedPuckPlayerLocationGoalData {
+    // puck_coords: TrimmedPuckLocations,
+    // puck_timesteps: Vec<usize>,
+    pub puck_goal_ids: Vec<u32>,
+    pub puck_timesteps: Vec<u32>,
+    pub puck_xs: Vec<f64>,
+    pub puck_ys: Vec<f64>,
+    pub player_goal_ids: Vec<u32>,
     // player_timesteps: Vec<usize>,
-    player_timesteps: Vec<u32>,
-    player_ids: Vec<u32>,
-    team_ids: Vec<u32>,
-    xs: Vec<f64>,
-    ys: Vec<f64>
+    pub player_timesteps: Vec<u32>,
+    pub player_ids: Vec<u32>,
+    pub team_ids: Vec<Option<u32>>,
+    pub player_xs: Vec<f64>,
+    pub player_ys: Vec<f64>
 }
 
 /// Pre-process the player and puck location data for a single goal
@@ -874,6 +879,20 @@ pub fn preprocess_player_puck(raw_puck_player_tracking: &GoalRawPuckPlayerData, 
     let goal_iter;
     let num_rows_estimate;
     
+    // take the puck locations and build vecs used for df creation
+    let mut puck_goal_ids = Vec::with_capacity(timesteps.len());
+    let mut puck_timesteps = Vec::with_capacity(timesteps.len());
+    let mut puck_xs = Vec::with_capacity(timesteps.len());
+    let mut puck_ys = Vec::with_capacity(timesteps.len());
+
+    for (puck_coord, timestep) in zip(trimmed_puck_coords.coords, timesteps) {
+        puck_goal_ids.push(goal_details.event_id);
+        puck_timesteps.push(timestep as u32);
+        puck_xs.push(puck_coord.x);
+        puck_ys.push(puck_coord.y);
+    }
+
+    // player logic
     if cutoff_pt.is_none() {
         goal_iter = raw_puck_player_tracking.player_tracking[starting_pt..].iter().enumerate();
         num_rows_estimate = NUM_PLAYERS_ON_ICE_5V5 * raw_puck_player_tracking.player_tracking.len();
@@ -911,7 +930,7 @@ pub fn preprocess_player_puck(raw_puck_player_tracking: &GoalRawPuckPlayerData, 
                     goal_ids.push(goal_details.event_id);
                     player_timesteps.push(i as u32);
                     player_ids.push(player_info.id);
-                    team_ids.push(player_info.team_id);
+                    team_ids.push(Some(player_info.team_id));
                     xs.push(final_coord.x);
                     ys.push(final_coord.y);
                 }
@@ -924,14 +943,16 @@ pub fn preprocess_player_puck(raw_puck_player_tracking: &GoalRawPuckPlayerData, 
     }
 
     PreprocessedPuckPlayerLocationGoalData { 
-        puck_coords: trimmed_puck_coords, 
-        puck_timesteps: timesteps, 
-        goal_ids, 
+        puck_goal_ids,
+        puck_timesteps,
+        puck_xs,
+        puck_ys,
+        player_goal_ids: goal_ids, 
         player_timesteps, 
         player_ids, 
         team_ids, 
-        xs, 
-        ys 
+        player_xs: xs, 
+        player_ys: ys 
     }
 }
 
@@ -3904,25 +3925,35 @@ mod tests {
         };
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
-        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_goal_ids, vec![12, 12, 12]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 10.1211, y: 50.6584 });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 11.1211, y: 52.6584 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 12.1211, y: 54.6584 });
+        assert_eq!(result.puck_xs, vec![
+            10.1211, 
+            11.1211,
+            12.1211
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            50.6584,
+            52.6584,
+            54.6584
+        ]);
+        // assert_eq!(result.puck_coords.coords[0], Coord{ x: 10.1211, y: 50.6584 });
+        // assert_eq!(result.puck_coords.coords[1], Coord{ x: 11.1211, y: 52.6584 });
+        // assert_eq!(result.puck_coords.coords[2], Coord{ x: 12.1211, y: 54.6584 });
 
         assert_eq!(result.player_timesteps.len(), 9);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -3979,25 +4010,34 @@ mod tests {
         };
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
-        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2389.8789, y: 964.3416 });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2388.8789, y: 962.3416 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2387.8789, y: 960.3416 });
+        assert_eq!(result.puck_xs, vec![
+            2389.8789, 
+            2388.8789,
+            2387.8789
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            964.3416, 
+            962.3416,
+            960.3416
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 9);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -4065,25 +4105,34 @@ mod tests {
         };
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
-        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 1010.5, y: 900.5 });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2019.9, y: 776.4 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2250.4, y: 500.1444 });
+        assert_eq!(result.puck_xs, vec![
+            1010.5,
+            2019.9,
+            2250.4
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            900.5,
+            776.4,
+            500.1444
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 9);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -4169,25 +4218,34 @@ mod tests {
         };
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
-        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 11., y: 11. });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 12., y: 11. });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 13., y: 11. });
+        assert_eq!(result.puck_xs, vec![
+            11., 
+            12.,
+            13.
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            11., 
+            11.,
+            11.
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 9);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -4295,28 +4353,40 @@ mod tests {
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
         
-        assert_eq!(result.puck_coords.coords.len(), 6);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12, 12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2, 3, 4, 5
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2019.4606, y: 247.9944 });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2028.5012, y: 269.7925 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2021.4669, y: 270.5219 });
-        assert_eq!(result.puck_coords.coords[3], Coord{ x: 2173.5117, y: 418.5711 });
-        assert_eq!(result.puck_coords.coords[4], Coord{ x: 2172.869, y: 423.4482 });
-        assert_eq!(result.puck_coords.coords[5], Coord{ x: 2250.2745, y: 483.4997 });
+        assert_eq!(result.puck_xs, vec![
+            2019.4606,
+            2028.5012,
+            2021.4669,
+            2173.5117,
+            2172.869,
+            2250.2745
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            247.9944,
+            269.7925,
+            270.5219,
+            418.5711,
+            423.4482,
+            483.4997
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 18);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -4417,25 +4487,34 @@ mod tests {
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
 
-        assert_eq!(result.puck_coords.coords.len(), 3);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 2, 3
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 11., y: 12. });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2021.4669, y: 270.5219 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2173.5117, y: 418.5711 });
+        assert_eq!(result.puck_xs, vec![
+            11.,
+            2021.4669,
+            2173.5117
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            12.,
+            270.5219,
+            418.5711
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 15);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         
@@ -4551,27 +4630,38 @@ mod tests {
         let home_team_id = 16;
         let result = preprocess_player_puck(&raw_puck_player_tracking, &goal_details, home_team_id);
         
-        assert_eq!(result.puck_coords.coords.len(), 5);
+        assert_eq!(result.puck_goal_ids, vec![
+            12, 12, 12, 12, 12
+        ]);
         assert_eq!(result.puck_timesteps, vec![
             0, 1, 2, 4, 5
         ]);
-        assert_eq!(result.puck_coords.coords[0], Coord{ x: 2019.4606, y: 247.9944 });
-        assert_eq!(result.puck_coords.coords[1], Coord{ x: 2028.5012, y: 269.7925 });
-        assert_eq!(result.puck_coords.coords[2], Coord{ x: 2021.4669, y: 270.5219 });
-        assert_eq!(result.puck_coords.coords[3], Coord{ x: 2172.869, y: 423.4482 });
-        assert_eq!(result.puck_coords.coords[4], Coord{ x: 2250.2745, y: 483.4997 });
+        assert_eq!(result.puck_xs, vec![
+            2019.4606,
+            2028.5012,
+            2021.4669,
+            2172.869,
+            2250.2745,
+        ]);
+        assert_eq!(result.puck_ys, vec![
+            247.9944,
+            269.7925,
+            270.5219,
+            423.4482,
+            483.4997
+        ]);
 
         assert_eq!(result.player_timesteps.len(), 18);
         
         // to check output, use a hash set for each "row" of info
         let mut result_map = HashMap::new();
-        for i in 0..result.goal_ids.len() {
+        for i in 0..result.player_goal_ids.len() {
             result_map.insert((
-                result.goal_ids[i],
+                result.player_goal_ids[i],
                 result.player_timesteps[i],
                 result.player_ids[i],
-                result.team_ids[i],
-            ), (result.xs[i], result.ys[i])
+                result.team_ids[i].unwrap(),
+            ), (result.player_xs[i], result.player_ys[i])
         );
         }
         

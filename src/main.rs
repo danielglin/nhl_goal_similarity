@@ -1,12 +1,16 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser};
+use polars::frame::DataFrame;
 
+use core::num;
 use std::{collections::HashMap};
 use std::fmt::Display;
 use std::path::Path;
 
 
-use crate::preprocessing::{GameId, GoalId, PbpGoalLocData, TrackingType, TrimmedPuckLocations, preprocess_puck ,read_folder, take_last_n_instances};
+use crate::preprocessing::{
+    GameId, GoalId, PbpGoalLocData, PreprocessedPuckPlayerLocationGoalData, TrackingType, TrimmedPuckLocations, preprocess_player_puck, preprocess_puck, read_folder, take_last_n_instances
+};
 use crate::hdc_encoding::{_make_perm_arrays, create_grid_level_hypervecs, dist, encode_goal_seq_pos_scale};
 use polars::prelude::{Series, df, ParquetWriter, ParquetReader, SerReader, AnyValue};
 
@@ -14,7 +18,7 @@ mod preprocessing;
 mod hdc_encoding;
 
 use ndarray_npy::{read_npy, write_npy};
-use ndarray::{Array, Dim};
+use ndarray::{Array, Data, Dim};
 use serde_json;
 use std::fs;
 use std::io::BufReader;
@@ -32,6 +36,74 @@ fn main() -> Result<()> {
     let specified_game_id = GameId(args.game.parse::<u32>().expect(&format!("Invalid game id: {}", args.game)));
     let specified_goal_id = GoalId(args.goal.parse::<u32>().expect(&format!("Invalid game id: {}", args.goal)));
 
+    // export pre-processed puck and player location data if that option is
+    // chosen
+    if args.export_player_puck {
+        // read in location JSON's, rotate, and trim them
+        let input_dir = args.input_dir.expect("!!! In order to pre-process puck and player location data, an input directory is required.");
+        let mut loc_data = PbpGoalLocData {
+            tracking_type: TrackingType::PuckAndPlayer { goal_loc_data: HashMap::new() },
+            pbp_data: HashMap::new()
+        };
+
+        match read_folder(input_dir, &mut loc_data) {
+            Err(e) => {
+                return Err(anyhow!("Error when reading in data: {e}"))
+            },
+            _ => ()
+        };
+
+        let mut preprocessed_data_all_games = Vec::with_capacity(loc_data.pbp_data.len());
+        let mut game_ids_all_games: Vec<u32> = Vec::with_capacity(loc_data.pbp_data.len());
+
+        match &mut loc_data.tracking_type {
+            TrackingType::PuckAndPlayer { goal_loc_data } => {
+                
+                for (game_id, pbp_data) in &loc_data.pbp_data {
+                    let mut num_game_rows = 0; // counter for number of rows for the single game
+
+                    // use the game id to get all goal data for that game
+                    // and iterate through all those goals
+                    let goal_loc_data_map = match goal_loc_data.get(game_id) {
+                        Some(map) => map,
+                        None => {
+                            println!("No goal files found for game {}", game_id.0);
+                            continue;
+                        }
+                    };
+                    let home_team_id = pbp_data.home_team_id;
+
+                    // now go through all goals and pre-process the location data
+                    for goal_details in &pbp_data.goals {
+                        let raw_puck_locs = match goal_loc_data_map.get(&GoalId(goal_details.event_id)) {
+                            Some(rpl) => rpl,
+                            None => continue
+                        };
+                        let preprocessed_data_single_goal = preprocess_player_puck(raw_puck_locs, goal_details, home_team_id);
+                        
+                        num_game_rows += preprocessed_data_single_goal.puck_goal_ids.len() + preprocessed_data_single_goal.player_goal_ids.len();
+                        preprocessed_data_all_games.push(preprocessed_data_single_goal);
+                    }
+
+                    // build a vec of game id's
+                    let game_ids: Vec<u32> = std::iter::repeat_with(|| game_id.0).take(num_game_rows).collect();
+                    game_ids_all_games.extend(game_ids);
+                }
+
+                // build the final df
+                let mut puck_player_df = build_puck_player_df(preprocessed_data_all_games, game_ids_all_games)?;
+
+                // export the final df
+                let output_dir = args.output_dir.expect("Need to provide an output directory when exporting puck and player location data");
+                let mut file = std::fs::File::create(format!("{output_dir}/{PUCK_PLAYER_OUTPUT_NAME}"))?;
+                ParquetWriter::new(&mut file).finish(&mut puck_player_df)?;
+            },
+            _ => {
+                println!("Warning: failed to export puck and player data.");
+            }
+        };
+        return Ok(())
+    }
 
     // import goal hypervecs if the import option is chosen
     // this means we skip reading in the location JSON's and the goal encoding
@@ -264,7 +336,11 @@ struct Args {
 
     /// if set, takes the last n instances of each goal
     #[arg(long)]
-    last_n: Option<usize>
+    last_n: Option<usize>,
+
+    /// if true exports pre-processed puck and player location data
+    #[arg(long, requires = "output_dir")]
+    export_player_puck: bool,
 }
 
 /// helper type for keeping track of goal distances
@@ -278,6 +354,7 @@ struct GoalDist {
 const GRID_HV_OUTPUT_NAME: &str = "grid_hvs.npy";
 const PERM_ARRAYS_OUTPUT_NAME: &str = "perm_arrays.txt";
 const GOAL_HVS_OUTPUT_NAME: &str = "goal_hvs.parquet";
+const PUCK_PLAYER_OUTPUT_NAME: &str = "puck_player_data.parquet";
 
 /// exports the generated goal hypervecs and optionally the grid level hypervecs
 /// and the perm arrays
@@ -397,6 +474,55 @@ fn export_pp_loc_data<P: AsRef<Path> + Display>(
     Ok(())
 }
 
+/// Builds the final df of puck and player location data for all games
+/// `game_ids` has length of the number of puck rows plus the number
+/// of player rows
+// fn build_puck_player_df(all_goals_pp_data: Vec<PreprocessedPuckPlayerLocationGoalData>, num_rows: usize) -> Result<DataFrame> {
+fn build_puck_player_df(all_goals_pp_data: Vec<PreprocessedPuckPlayerLocationGoalData>, game_ids: Vec<u32>) -> Result<DataFrame> {
+    let num_rows = game_ids.len();
+    let mut goal_ids = Vec::with_capacity(num_rows);
+    let mut timesteps = Vec::with_capacity(num_rows);
+    let mut xs = Vec::with_capacity(num_rows);
+    let mut ys = Vec::with_capacity(num_rows);
+    let mut team_ids = Vec::with_capacity(num_rows);
+    let mut entity_ids = Vec::with_capacity(num_rows);
+
+    for pp_loc_data_single_goal in all_goals_pp_data {
+        // read in puck data
+        // build vec of None's for puck's team id's
+        let puck_team_ids: Vec<Option<u32>> = std::iter::repeat_with(|| None).take(pp_loc_data_single_goal.puck_goal_ids.len()).collect();
+
+        // build vec of 1's for puck's entity id
+        let puck_entity_ids: Vec<u32> = std::iter::repeat_with(|| 1).take(pp_loc_data_single_goal.puck_goal_ids.len()).collect();
+        
+        goal_ids.extend(pp_loc_data_single_goal.puck_goal_ids);
+        timesteps.extend(pp_loc_data_single_goal.puck_timesteps);
+        xs.extend(pp_loc_data_single_goal.puck_xs);
+        ys.extend(pp_loc_data_single_goal.puck_ys);
+        team_ids.extend(puck_team_ids);
+        entity_ids.extend(puck_entity_ids);
+
+        // read in player data
+        goal_ids.extend(pp_loc_data_single_goal.player_goal_ids);
+        timesteps.extend(pp_loc_data_single_goal.player_timesteps);
+        xs.extend(pp_loc_data_single_goal.player_xs);
+        ys.extend(pp_loc_data_single_goal.player_ys);
+        team_ids.extend(pp_loc_data_single_goal.team_ids);
+        entity_ids.extend(pp_loc_data_single_goal.player_ids);
+        
+    }
+    let export_df = df!(
+        "game_id" => game_ids,
+        "goal_id" => goal_ids,
+        "timestep" => timesteps,
+        "team_id" => team_ids,
+        "entity_id" => entity_ids,
+        "x" => xs,
+        "y" => ys
+    )?;
+    Ok(export_df)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +571,379 @@ mod tests {
         let second_goal_hv = goal_hvs_map.get(&(GameId(2024020081), GoalId(231))).unwrap();
         let expected_second_goal_hv = array![false, false, false, true, false];
         assert_eq!(second_goal_hv, expected_second_goal_hv);
+    }
+
+    // --------------------------------------------------
+    // build_puck_player_df() tests
+    // --------------------------------------------------
+
+    // one game
+    #[test]
+    fn build_puck_player_one() {
+        const PUCK_DUMMY_TEAM_ID: u32 = 999;
+
+        let pp_data = vec![
+            PreprocessedPuckPlayerLocationGoalData{
+                puck_goal_ids: vec![1, 1, 1], // 3 puck rows
+                puck_timesteps: vec![0, 1, 2],
+                puck_xs: vec![123., 124., 125.],
+                puck_ys: vec![23., 24., 25.],
+                player_goal_ids: vec![1, 1, 1, 1, 1, 1, 1, 1, 1], // 9 player rows
+                player_timesteps: vec![0, 0, 0, 1, 1, 1, 2, 2, 2],
+                player_ids: vec![812, 813, 814, 812, 813, 814, 812, 813, 814],
+                team_ids: vec![Some(12), Some(12), Some(27), Some(12), Some(12), Some(27), Some(12), Some(12), Some(27)],
+                player_xs: vec![200., 300., 400., 201., 301., 401., 202., 302., 402. ],
+                player_ys: vec![500., 600., 700., 501., 601., 701., 502., 602., 702. ]
+            }
+        ];
+        let game_ids = vec![
+            2024000001, 2024000001, 2024000001, 2024000001, // for puck rows
+            2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001, // for player rows
+        ];
+        let df = build_puck_player_df(pp_data, game_ids).unwrap();
+
+        assert_eq!(df.height(), 12);
+        let rslt_game_ids = df.select_columns(["game_id"]).unwrap()[0].clone();
+        let rslt_goal_ids = df.select_columns(["goal_id"]).unwrap()[0].clone();
+        let rslt_timesteps = df.select_columns(["timestep"]).unwrap()[0].clone();
+        let rslt_team_ids = df.select_columns(["team_id"]).unwrap()[0].clone();
+        let rslt_entity_ids = df.select_columns(["entity_id"]).unwrap()[0].clone();
+        let rslt_xs = df.select_columns(["x"]).unwrap()[0].clone();
+        let rslt_ys = df.select_columns(["y"]).unwrap()[0].clone();
+
+        // loop thr/ all 12 rows to check they're correct
+        let mut result_map = HashMap::new();
+        for i in 0..df.height() {
+            result_map.insert((
+                rslt_game_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_goal_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_timesteps.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_entity_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+            ), (
+                rslt_team_ids.get(i).unwrap().try_extract::<u32>().unwrap_or(PUCK_DUMMY_TEAM_ID),
+                rslt_xs.get(i).unwrap().try_extract::<f64>().unwrap(),
+                rslt_ys.get(i).unwrap().try_extract::<f64>().unwrap(),
+            )
+        );
+        }
+        
+        assert_eq!(result_map.len(), 12);
+
+        // puck info
+        assert_eq!(result_map[&(2024000001, 1, 0, 1)], (PUCK_DUMMY_TEAM_ID, 123., 23.));
+        assert_eq!(result_map[&(2024000001, 1, 1, 1)], (PUCK_DUMMY_TEAM_ID, 124., 24.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 1)], (PUCK_DUMMY_TEAM_ID, 125., 25.));
+
+        // player info
+        assert_eq!(result_map[&(2024000001, 1, 0, 812)], (12, 200., 500.)); // first timestep
+        assert_eq!(result_map[&(2024000001, 1, 0, 813)], (12, 300., 600.));
+        assert_eq!(result_map[&(2024000001, 1, 0, 814)], (27, 400., 700.));
+
+        assert_eq!(result_map[&(2024000001, 1, 1, 812)], (12, 201., 501.)); // second timestep
+        assert_eq!(result_map[&(2024000001, 1, 1, 813)], (12, 301., 601.));
+        assert_eq!(result_map[&(2024000001, 1, 1, 814)], (27, 401., 701.));
+
+        assert_eq!(result_map[&(2024000001, 1, 2, 812)], (12, 202., 502.)); // third timestep
+        assert_eq!(result_map[&(2024000001, 1, 2, 813)], (12, 302., 602.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 814)], (27, 402., 702.));
+    }
+
+    // a game w/ missing puck data at a few timesteps
+    #[test]
+    fn build_puck_player_missing_pucks() {
+        const PUCK_DUMMY_TEAM_ID: u32 = 999;
+
+        let pp_data = vec![
+            PreprocessedPuckPlayerLocationGoalData{
+                puck_goal_ids: vec![1, 1], // 2 puck rows
+                puck_timesteps: vec![0, 2],
+                puck_xs: vec![123., 124.],
+                puck_ys: vec![23., 24.],
+                player_goal_ids: vec![
+                    1, 1, 1, 1, 1, 1, 
+                    1, 1, 1, 1, 1, 1
+                ], // 12 player rows
+                player_timesteps: vec![
+                    0, 0, 0, 1, 1, 1, 
+                    2, 2, 2, 3, 3, 3
+                ],
+                player_ids: vec![
+                    812, 813, 814, 812, 813, 814, 
+                    812, 813, 814, 812, 813, 814
+                ],
+                team_ids: vec![
+                    Some(12), Some(12), Some(27), Some(12), Some(12), Some(27),
+                    Some(12), Some(12), Some(27), Some(12), Some(12), Some(27)
+                ],
+                player_xs: vec![
+                    200., 300., 400., 201., 301., 401., 
+                    202., 302., 402., 203., 303., 403.
+                ],
+                player_ys: vec![
+                    500., 600., 700., 501., 601., 701., 
+                    502., 602., 702., 503., 603., 703.
+                ]
+            }
+        ];
+        let game_ids = vec![
+            2024000001, 2024000001, // for puck rows
+            2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 
+            2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001// for player rows
+        ];
+        let df = build_puck_player_df(pp_data, game_ids).unwrap();
+
+        assert_eq!(df.height(), 14);
+        let rslt_game_ids = df.select_columns(["game_id"]).unwrap()[0].clone();
+        let rslt_goal_ids = df.select_columns(["goal_id"]).unwrap()[0].clone();
+        let rslt_timesteps = df.select_columns(["timestep"]).unwrap()[0].clone();
+        let rslt_team_ids = df.select_columns(["team_id"]).unwrap()[0].clone();
+        let rslt_entity_ids = df.select_columns(["entity_id"]).unwrap()[0].clone();
+        let rslt_xs = df.select_columns(["x"]).unwrap()[0].clone();
+        let rslt_ys = df.select_columns(["y"]).unwrap()[0].clone();
+
+        // loop thr/ all 12 rows to check they're correct
+        let mut result_map = HashMap::new();
+        for i in 0..df.height() {
+            result_map.insert((
+                rslt_game_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_goal_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_timesteps.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_entity_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+            ), (
+                rslt_team_ids.get(i).unwrap().try_extract::<u32>().unwrap_or(PUCK_DUMMY_TEAM_ID),
+                rslt_xs.get(i).unwrap().try_extract::<f64>().unwrap(),
+                rslt_ys.get(i).unwrap().try_extract::<f64>().unwrap(),
+            )
+        );
+        }
+        
+        assert_eq!(result_map.len(), 14);
+
+        // puck info
+        assert_eq!(result_map[&(2024000001, 1, 0, 1)], (PUCK_DUMMY_TEAM_ID, 123., 23.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 1)], (PUCK_DUMMY_TEAM_ID, 124., 24.));
+
+        // player info
+        assert_eq!(result_map[&(2024000001, 1, 0, 812)], (12, 200., 500.)); // first timestep
+        assert_eq!(result_map[&(2024000001, 1, 0, 813)], (12, 300., 600.));
+        assert_eq!(result_map[&(2024000001, 1, 0, 814)], (27, 400., 700.));
+
+        assert_eq!(result_map[&(2024000001, 1, 1, 812)], (12, 201., 501.)); // second timestep
+        assert_eq!(result_map[&(2024000001, 1, 1, 813)], (12, 301., 601.));
+        assert_eq!(result_map[&(2024000001, 1, 1, 814)], (27, 401., 701.));
+
+        assert_eq!(result_map[&(2024000001, 1, 2, 812)], (12, 202., 502.)); // third timestep
+        assert_eq!(result_map[&(2024000001, 1, 2, 813)], (12, 302., 602.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 814)], (27, 402., 702.));
+
+        assert_eq!(result_map[&(2024000001, 1, 3, 812)], (12, 203., 503.)); // fourth timestep
+        assert_eq!(result_map[&(2024000001, 1, 3, 813)], (12, 303., 603.));
+        assert_eq!(result_map[&(2024000001, 1, 3, 814)], (27, 403., 703.));
+    }
+
+    // one game that's doesn't have player data for some timesteps
+    #[test]
+    fn build_puck_player_missing_players() {
+        const PUCK_DUMMY_TEAM_ID: u32 = 999;
+
+        let pp_data = vec![
+            PreprocessedPuckPlayerLocationGoalData{
+                puck_goal_ids: vec![1, 1, 1], // 3 puck rows
+                puck_timesteps: vec![0, 1, 2],
+                puck_xs: vec![123., 124., 125.],
+                puck_ys: vec![23., 24., 25.],
+                player_goal_ids: vec![
+                    1, 1, 1, 
+                    1, 1, 
+                ], // 5 player rows
+                player_timesteps: vec![
+                    0, 0, 0,
+                    2, 2,
+                ],
+                player_ids: vec![
+                    812, 813, 814,
+                    812, 814, 
+                ],
+                team_ids: vec![
+                    Some(12), Some(12), Some(27),
+                    Some(12), Some(27),
+                ],
+                player_xs: vec![
+                    200., 300., 400.,
+                    202., 402.
+                ],
+                player_ys: vec![
+                    500., 600., 700.,
+                    502., 702.
+                ]
+            }
+        ];
+        let game_ids = vec![
+            2024000001, 2024000001, 2024000001, // for puck rows
+            2024000001, 2024000001, 2024000001, 
+            2024000001, 2024000001 // for player rows
+        ];
+        let df = build_puck_player_df(pp_data, game_ids).unwrap();
+
+        assert_eq!(df.height(), 8);
+        let rslt_game_ids = df.select_columns(["game_id"]).unwrap()[0].clone();
+        let rslt_goal_ids = df.select_columns(["goal_id"]).unwrap()[0].clone();
+        let rslt_timesteps = df.select_columns(["timestep"]).unwrap()[0].clone();
+        let rslt_team_ids = df.select_columns(["team_id"]).unwrap()[0].clone();
+        let rslt_entity_ids = df.select_columns(["entity_id"]).unwrap()[0].clone();
+        let rslt_xs = df.select_columns(["x"]).unwrap()[0].clone();
+        let rslt_ys = df.select_columns(["y"]).unwrap()[0].clone();
+
+        // loop thr/ all rows to check they're correct
+        let mut result_map = HashMap::new();
+        for i in 0..df.height() {
+            result_map.insert((
+                rslt_game_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_goal_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_timesteps.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_entity_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+            ), (
+                rslt_team_ids.get(i).unwrap().try_extract::<u32>().unwrap_or(PUCK_DUMMY_TEAM_ID),
+                rslt_xs.get(i).unwrap().try_extract::<f64>().unwrap(),
+                rslt_ys.get(i).unwrap().try_extract::<f64>().unwrap(),
+            )
+        );
+        }
+        
+        assert_eq!(result_map.len(), 8);
+
+        // puck info
+        assert_eq!(result_map[&(2024000001, 1, 0, 1)], (PUCK_DUMMY_TEAM_ID, 123., 23.));
+        assert_eq!(result_map[&(2024000001, 1, 1, 1)], (PUCK_DUMMY_TEAM_ID, 124., 24.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 1)], (PUCK_DUMMY_TEAM_ID, 125., 25.));
+
+        // player info
+        assert_eq!(result_map[&(2024000001, 1, 0, 812)], (12, 200., 500.)); // first timestep
+        assert_eq!(result_map[&(2024000001, 1, 0, 813)], (12, 300., 600.));
+        assert_eq!(result_map[&(2024000001, 1, 0, 814)], (27, 400., 700.));
+
+        assert_eq!(result_map[&(2024000001, 1, 2, 812)], (12, 202., 502.)); // third timestep
+        assert_eq!(result_map[&(2024000001, 1, 2, 814)], (27, 402., 702.));
+    }
+
+    // multiple games, w/ one missing some puck data and the other missing
+    // some player data
+    #[test]
+    fn build_puck_player_multi() {
+        const PUCK_DUMMY_TEAM_ID: u32 = 999;
+
+        let pp_data = vec![
+            PreprocessedPuckPlayerLocationGoalData{
+                puck_goal_ids: vec![
+                    1, 1, 1, // first game
+                    2, 2     // second game
+                ], // 5 puck rows
+                puck_timesteps: vec![
+                    0, 1, 2,
+                    0, 3
+                ],
+                puck_xs: vec![
+                    123., 124., 125.,
+                    700., 703.
+                ],
+                puck_ys: vec![
+                    23., 24., 25.,
+                    900., 903.
+                ],
+                player_goal_ids: vec![
+                    1, 1, 1, 1, 1, 1,                   // game 1
+                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // game 2
+                ], // 18 player rows
+                player_timesteps: vec![
+                    0, 0, 0, 1, 1, 1,
+                    0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3
+                ],
+                player_ids: vec![
+                    812, 813, 814, 812, 813, 814,
+                    801, 804, 809, 801, 804, 809, 801, 804, 809, 801, 804, 809
+                ],
+                team_ids: vec![
+                    Some(12), Some(12), Some(27), Some(12), Some(12), Some(27),
+                    Some(21), Some(21), Some(14), Some(21), Some(21), Some(14), Some(21), Some(21), Some(14), Some(21), Some(21), Some(14)
+                ],
+                player_xs: vec![
+                    200., 300., 400., 201., 301., 401.,
+                    531., 631., 731., 532., 632., 732., 533., 633., 733., 534., 634., 734.,
+                ],
+                player_ys: vec![
+                    500., 600., 700., 501., 601., 701.,
+                    201., 301., 401., 202., 302., 402., 203., 303., 403., 204., 304., 404.,
+                ]
+            }
+        ];
+        let game_ids = vec![
+            2024000001, 2024000001, 2024000001, 
+            2024000022, 2024000022, // for puck rows
+            2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 2024000001, 
+            2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022, 2024000022// for player rows
+        ];
+        let df = build_puck_player_df(pp_data, game_ids).unwrap();
+
+        assert_eq!(df.height(), 23);
+        let rslt_game_ids = df.select_columns(["game_id"]).unwrap()[0].clone();
+        let rslt_goal_ids = df.select_columns(["goal_id"]).unwrap()[0].clone();
+        let rslt_timesteps = df.select_columns(["timestep"]).unwrap()[0].clone();
+        let rslt_team_ids = df.select_columns(["team_id"]).unwrap()[0].clone();
+        let rslt_entity_ids = df.select_columns(["entity_id"]).unwrap()[0].clone();
+        let rslt_xs = df.select_columns(["x"]).unwrap()[0].clone();
+        let rslt_ys = df.select_columns(["y"]).unwrap()[0].clone();
+
+        // loop thr/ all rows to check they're correct
+        let mut result_map = HashMap::new();
+        for i in 0..df.height() {
+            result_map.insert((
+                rslt_game_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_goal_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_timesteps.get(i).unwrap().try_extract::<u32>().unwrap(),
+                rslt_entity_ids.get(i).unwrap().try_extract::<u32>().unwrap(),
+            ), (
+                rslt_team_ids.get(i).unwrap().try_extract::<u32>().unwrap_or(PUCK_DUMMY_TEAM_ID),
+                rslt_xs.get(i).unwrap().try_extract::<f64>().unwrap(),
+                rslt_ys.get(i).unwrap().try_extract::<f64>().unwrap(),
+            )
+        );
+        }
+        
+        assert_eq!(result_map.len(), 23);
+
+        // puck info
+        assert_eq!(result_map[&(2024000001, 1, 0, 1)], (PUCK_DUMMY_TEAM_ID, 123., 23.)); // first game
+        assert_eq!(result_map[&(2024000001, 1, 1, 1)], (PUCK_DUMMY_TEAM_ID, 124., 24.));
+        assert_eq!(result_map[&(2024000001, 1, 2, 1)], (PUCK_DUMMY_TEAM_ID, 125., 25.));
+
+        assert_eq!(result_map[&(2024000022, 2, 0, 1)], (PUCK_DUMMY_TEAM_ID, 700., 900.)); // second game
+        assert_eq!(result_map[&(2024000022, 2, 3, 1)], (PUCK_DUMMY_TEAM_ID, 703., 903.));
+
+        // player info
+        // first game
+        assert_eq!(result_map[&(2024000001, 1, 0, 812)], (12, 200., 500.)); // first timestep
+        assert_eq!(result_map[&(2024000001, 1, 0, 813)], (12, 300., 600.));
+        assert_eq!(result_map[&(2024000001, 1, 0, 814)], (27, 400., 700.));
+
+        assert_eq!(result_map[&(2024000001, 1, 1, 812)], (12, 201., 501.)); // second timestep
+        assert_eq!(result_map[&(2024000001, 1, 1, 813)], (12, 301., 601.));
+        assert_eq!(result_map[&(2024000001, 1, 1, 814)], (27, 401., 701.));
+
+        // second game
+        assert_eq!(result_map[&(2024000022, 2, 0, 801)], (21, 531., 201.)); // first timestep
+        assert_eq!(result_map[&(2024000022, 2, 0, 804)], (21, 631., 301.));
+        assert_eq!(result_map[&(2024000022, 2, 0, 809)], (14, 731., 401.));
+
+        assert_eq!(result_map[&(2024000022, 2, 1, 801)], (21, 532., 202.)); // second timestep
+        assert_eq!(result_map[&(2024000022, 2, 1, 804)], (21, 632., 302.));
+        assert_eq!(result_map[&(2024000022, 2, 1, 809)], (14, 732., 402.));
+
+        assert_eq!(result_map[&(2024000022, 2, 2, 801)], (21, 533., 203.)); // third timestep
+        assert_eq!(result_map[&(2024000022, 2, 2, 804)], (21, 633., 303.));
+        assert_eq!(result_map[&(2024000022, 2, 2, 809)], (14, 733., 403.));
+
+        assert_eq!(result_map[&(2024000022, 2, 3, 801)], (21, 534., 204.)); // fourth timestep
+        assert_eq!(result_map[&(2024000022, 2, 3, 804)], (21, 634., 304.));
+        assert_eq!(result_map[&(2024000022, 2, 3, 809)], (14, 734., 404.));
     }
 }
