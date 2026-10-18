@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use clap::{Parser};
 use polars::frame::DataFrame;
 
-use core::num;
 use std::{collections::HashMap};
 use std::fmt::Display;
 use std::path::Path;
@@ -18,7 +17,7 @@ mod preprocessing;
 mod hdc_encoding;
 
 use ndarray_npy::{read_npy, write_npy};
-use ndarray::{Array, Data, Dim};
+use ndarray::{Array, Dim};
 use serde_json;
 use std::fs;
 use std::io::BufReader;
@@ -167,11 +166,6 @@ fn main() -> Result<()> {
                 println!("Warning: failed to pre-process data in puck-only mode.");
             }
         };
-
-
-        // // OLD
-        // let mut preprocessed_data = preprocess_folder_data(&loc_data);
-        // // END OLD
 
         // take the last n instances of each goal if specified
         if args.last_n.is_some() {
