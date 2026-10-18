@@ -163,7 +163,6 @@ pub fn read_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<RawPuckLocatio
     }
 }
 
-// TODO: Figure out the return type and make a new struc if needed
 /// Reads in the goal location data and returns both puck and player location info
 pub fn read_puck_player_loc_data<P: AsRef<Path> + Display>(path: P) -> Result<GoalRawPuckPlayerData> {
     const PUCK_ID: &str = "1";
@@ -437,25 +436,6 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
                                 };
                             }
                         };
-                        // let loc_data = match read_loc_data(&game_path.to_str().ok_or(anyhow!("invalid path"))?) {
-                        //     Ok(ld) => ld,
-                        //     Err(e) => {
-                        //         println!("*** Error {e} when trying to parse goal data at {}", &game_path.to_string_lossy());
-                        //         continue
-                        //     }
-                        // };
-                        // // add goal location data
-                        // match pbp_goal_data.goal_loc_data.get_mut(&game_id) {
-                        //     Some(map) => {
-                        //         map.insert(goal_id, loc_data);
-                        //     },
-                        //     None => {
-                        //         // need to create a new map if it doesn't exist
-                        //         let mut goals_map = HashMap::new();
-                        //         goals_map.insert(goal_id, loc_data);
-                        //         pbp_goal_data.goal_loc_data.insert(game_id, goals_map);
-                        //     }
-                        // };
                     }
                     // read in the play-by-play files
                     else {
@@ -479,9 +459,7 @@ pub fn read_folder<P: AsRef<Path> + Display>(dir: P, pbp_goal_data: &mut PbpGoal
     } else {
         return Err(anyhow!("Can't find directory {}", dir));
     }
-    // let entries = read_dir(&dir)?
-    //     .collect::<Result<Vec<_>, io::Error>>()?;
-    // println!("entries in {}: {:?}", dir, entries);
+
     Ok(())
 }
 
@@ -499,19 +477,12 @@ fn _rotate_coord(coord: ClampedCoord) -> Coord {
 }
 
 /// Rotates a goal's coordinates by 180 degrees
-fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocations {
-    // const MAX_X: f64 = 2400.;
-    // const MAX_Y: f64 = 1015.;
-    
+fn rotate_goal_coords(puck_locs: Vec<Option<ClampedCoord>>) -> RotatedPuckLocations {    
     let mut rotated_coords = Vec::with_capacity(puck_locs.len());
 
     for coord in puck_locs {
         match coord {
             Some(c) => {
-                // let rot_x_pos = MAX_X - c.get_x();
-                // let rot_y_pos = MAX_Y - c.get_y();
-                // let coord = Coord{ x: rot_x_pos, y: rot_y_pos };
-                // rotated_coords.push(Some(coord));
                 let rot_coord = _rotate_coord(c);
                 
                 rotated_coords.push(Some(rot_coord));
@@ -606,10 +577,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             // also need to handle if the very first instant is None
             // if ((instant_num == (starting_pt + 1)) && (starting_offset > 1)) || (instant_num == 0) { // old version
             if (((instant_num == (starting_pt)) || (instant_num == (starting_pt+1) && in_faceoff))&& (starting_offset > 1)) || (instant_num == 0) { // new version
-                // println!("instant_num: {instant_num}, starting_pt: {starting_pt}");
                 starting_pt += 1;
-                // none_start_incremented_starting_pt = true;
-                // println!("in modified if: instant_num: {instant_num}, starting_pt: {starting_pt}");
             }
 
             // handle cases where if have None's at the start and then puck's
@@ -618,7 +586,6 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             if instant_num == 0 {
                 none_start_incremented_starting_pt = true;
             }
-            // println!("at end of instance loop for None's; instance: instant_num: {instant_num}, instance: {instance:?}, starting_pt: {starting_pt}, starting OFFSET: {starting_offset}");
             continue;
         }
         let instance_bare = instance.as_ref().unwrap(); // instance is guaranteed to be Some here due to None check above
@@ -632,8 +599,6 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
                 first_instance = instance;
             } else {                
                 let first_instance_bare = first_instance.as_ref().unwrap();
-                // println!("x dists fr first instance: {}", (instance_bare.x - first_instance_bare.x).abs());
-                // println!("y dists fr first instance: {}", (instance_bare.y - first_instance_bare.y).abs());
                 if ((instance_bare.x - first_instance_bare.x).abs() > EPSILON) ||
                     ((instance_bare.y - first_instance_bare.y).abs() > EPSILON) {
                         puck_stationary = false;
@@ -676,9 +641,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
                 (((instance_bare.x - BOTTOM_OFF_DOT_X).abs() <= FACEOFF_THRESHOLD) &&
                 ((instance_bare.y - BOTTOM_OFF_DOT_Y).abs() <= FACEOFF_THRESHOLD)) 
             {
-                // println!("instance_bare: {:?} in faceoff dot", instance_bare);
                 in_faceoff = true;
-                // ever_in_faceoff = true;
             }
             
         }
@@ -694,8 +657,6 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             // so if the puck is still close to the first instant, that will 
             // need to be trimmed
             starting_pt += 1;
-            // println!("instance_bare: {:?} to be trimmed", instance_bare);
-            // println!("stationary, not none first instance, in faceoff; instant_num: {instant_num}, starting_pt: {starting_pt}");
         }
         
         // trim the end
@@ -703,7 +664,6 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
             (instance_bare.y >= GOAL_TOP) && (instance_bare.y <= GOAL_BOTTOM) 
         {
             if earliest_perc_in_goal.is_none() {
-                // earliest_instant_in_goal = &Some(instant_num);
                 earliest_perc_in_goal = Some((instant_num as f64)/(num_instances as f64));
             }
 
@@ -770,15 +730,7 @@ fn trim_goal_coords(goal: &RotatedPuckLocations) -> (usize, Option<usize>) {
     if none_start_incremented_starting_pt && in_faceoff {
         starting_pt -= 1;
     }
-    // println!("final starting_pt: {starting_pt}");
-    // println!("rotated puck locs: {goal:?}");
-    // println!("rotated puck locs:");
-    // debug: print goal
-    // let mut i = 0;
-    // for p_coord in &goal.coords {
-    //     println!("{i}: {p_coord:?}");
-    //     i += 1;
-    // }
+
     (starting_pt, cutoff_pt)
 }
 
@@ -852,14 +804,11 @@ pub fn preprocess_puck(raw_puck_tracking: &RawPuckLocationData, goal_details: &G
 
 /// Pre-processed puck and player location data for a single goal
 pub struct PreprocessedPuckPlayerLocationGoalData {
-    // puck_coords: TrimmedPuckLocations,
-    // puck_timesteps: Vec<usize>,
     pub puck_goal_ids: Vec<u32>,
     pub puck_timesteps: Vec<u32>,
     pub puck_xs: Vec<f64>,
     pub puck_ys: Vec<f64>,
     pub player_goal_ids: Vec<u32>,
-    // player_timesteps: Vec<usize>,
     pub player_timesteps: Vec<u32>,
     pub player_ids: Vec<u32>,
     pub team_ids: Vec<Option<u32>>,
